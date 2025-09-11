@@ -8,8 +8,8 @@ import re
 # ----------------- CONFIG -----------------
 repo_dir = os.getcwd()
 main_branch = "main"
-main_file = "main.py"  # single large file
-changes_file = "changes.py"  # only changed blocks returned by OpenAI
+main_file = "main.py"
+changes_file = "changes.py"
 
 openai.api_key = os.getenv("OPENAI_API_KEY")
 GH_PAT = os.getenv("GH_PAT")
@@ -23,23 +23,28 @@ repo.git.config("user.name", "github-actions[bot]")
 repo.git.config("user.email", "github-actions[bot]@users.noreply.github.com")
 repo.git.checkout(main_branch)
 
-# ----------------- READ main.py -----------------
+# ----------------- READ MAIN FILE -----------------
 with open(main_file, "r") as f:
-    main_content = f.read()
+    main_code = f.read()
 
 # ----------------- CREATE OPENAI PROMPT -----------------
 prompt = f"""
 Issue: {issue_title}
 Description: {issue_body}
 
-You are given a large Python file (main.py). Only suggest the minimal code changes needed 
-to resolve the issue. Do NOT return the full file. 
+You are given the following main.py code:
 
-Return code ONLY with ### UPDATED START and ### UPDATED END markers.
-Strip all explanations, comments, or text. Only code inside the markers should be returned.
+{main_code}
+
+Instructions:
+- Only return the Python code parts that need to be changed or added.
+- Do NOT return the entire 600+ lines.
+- Do NOT include explanations or markdown.
+- Mark updated sections with:
+### UPDATED START
+<updated code here>
+### UPDATED END
 """
-
-prompt += f"\n\n# Current main.py snippet:\n{main_content[:2000]}...\n"
 
 # ----------------- CALL OPENAI -----------------
 response = openai.chat.completions.create(
@@ -50,44 +55,31 @@ response = openai.chat.completions.create(
 
 changes_text = response.choices[0].message.content.strip()
 
+# Exit if no changes
 if not changes_text:
-    print("No changes suggested by OpenAI. Exiting.")
+    print("No changes detected. Exiting.")
     exit(0)
 
-# ----------------- KEEP ONLY CODE BLOCKS -----------------
-blocks = re.findall(r"### UPDATED START([\s\S]*?)### UPDATED END", changes_text)
-code_only_changes = "\n".join(blocks)
-
+# ----------------- WRITE CHANGES -----------------
 with open(changes_file, "w") as f:
-    f.write(code_only_changes)
+    f.write(changes_text)
 
-# ----------------- MERGE CHANGES INTO main.py -----------------
-def merge_changes(original, changes):
-    """
-    Replace existing ### UPDATED START/END blocks with changes or append at end.
-    """
-    original_blocks = re.findall(r"### UPDATED START[\s\S]*?### UPDATED END", original)
-    merged = original
-    for block in re.findall(r"### UPDATED START[\s\S]*?### UPDATED END", changes):
-        if original_blocks:
-            merged = re.sub(r"### UPDATED START[\s\S]*?### UPDATED END", block, merged, count=1)
-        else:
-            merged += "\n\n" + block
-    return merged
+# ----------------- MERGE CHANGES INTO MAIN -----------------
+updated_sections = re.findall(r"### UPDATED START(.*?)### UPDATED END", changes_text, flags=re.S)
+merged_code = main_code
+for section in updated_sections:
+    merged_code = re.sub(r"### UPDATED START.*?### UPDATED END", section.strip(), merged_code, flags=re.S)
 
-merged_content = merge_changes(main_content, code_only_changes)
-
-# ----------------- CREATE NEW BRANCH -----------------
+# Write updated main.py in new branch
 branch_name = f"issue-{uuid.uuid4().hex[:8]}"
 repo.git.checkout("-b", branch_name)
 
-# ----------------- WRITE UPDATED main.py -----------------
 with open(main_file, "w") as f:
-    f.write(merged_content)
+    f.write(merged_code)
 
 # ----------------- COMMIT & PUSH -----------------
 repo.git.add(all=True)
-repo.git.commit("-m", f"Auto-update main.py for issue: {issue_title}")
+repo.git.commit("-m", f"Auto-update for issue: {issue_title}")
 repo.git.push("origin", branch_name)
 
 # ----------------- CREATE PULL REQUEST -----------------
