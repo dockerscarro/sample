@@ -43,7 +43,7 @@ Description: {issue_body}
 
 Generate ONLY the modifications needed to address this issue.
 - Do not rewrite the entire file.
-- Return ONLY valid Python code (no explanations) inside triple backticks.
+- Return ONLY valid Python code inside triple backticks (no explanations).
 """
 
 try:
@@ -103,21 +103,30 @@ except Exception as e:
     exit(1)
 
 # ----------------- EXTRACT FINAL UPDATED CODE -----------------
-code_blocks = re.findall(r"```(?:python)?(.*?)```", merged_text, flags=re.S)
-if not code_blocks:
-    code_blocks = [merged_text]
-
-final_code = code_blocks[0].strip()
+code_blocks = re.findall(r"```(?:python)?\s*(.*?)```", merged_text, flags=re.S)
+if code_blocks:
+    final_code = code_blocks[0].strip()
+else:
+    # fallback: remove any leading/trailing non-code lines
+    final_code = "\n".join(
+        line for line in merged_text.splitlines() 
+        if not line.strip().startswith("```")
+    ).strip()
 
 if not final_code:
     print("❌ GPT returned empty merged code. Exiting.")
     exit(1)
+
+# ----------------- CLEAN EXTRA NON-CODE CHARACTERS -----------------
+final_code = re.sub(r"[^\x09\x0A\x0D\x20-\x7E]+", "", final_code)
 
 # ----------------- SYNTAX CHECK -----------------
 try:
     compile(final_code, main_file, "exec")
 except SyntaxError as e:
     print(f"❌ GPT returned code with syntax errors: {e}")
+    with open("failed_gpt_output.py", "w") as f:
+        f.write(final_code)
     exit(1)
 
 # ----------------- WRITE UPDATED main.py -----------------
