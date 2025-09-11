@@ -7,16 +7,15 @@ on:
 jobs:
   auto_update:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
 
     steps:
-      # 1️⃣ Checkout repository
+      # 1️⃣ Checkout the repository using GH_PAT
       - name: Checkout repo
         uses: actions/checkout@v3
         with:
           token: ${{ secrets.GH_PAT }}
 
-      # 2️⃣ Set Git identity
+      # 2️⃣ Set Git identity for committing
       - name: Set Git identity
         run: |
           git config --global user.name "github-actions[bot]"
@@ -28,22 +27,13 @@ jobs:
         with:
           python-version: '3.11'
 
-      # 4️⃣ Cache pip dependencies
-      - name: Cache pip
-        uses: actions/cache@v3
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      # 5️⃣ Install dependencies
+      # 4️⃣ Install dependencies
       - name: Install dependencies
         run: |
           pip install --upgrade pip
           pip install openai gitpython requests
 
-      # 6️⃣ Run auto-update script
+      # 5️⃣ Run the auto-update Python script
       - name: Run auto-update script
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
