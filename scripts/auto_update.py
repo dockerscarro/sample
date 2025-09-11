@@ -75,7 +75,7 @@ for section in sections_to_update:
 
 # ----------------- CALL OPENAI -----------------
 response = openai.chat.completions.create(
-    model="gpt-40-mini",
+    model="gpt-4o-mini-tts",
     messages=[{"role": "user", "content": prompt}],
     temperature=0
 )
