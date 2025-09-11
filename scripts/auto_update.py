@@ -1,10 +1,10 @@
 import os
 import uuid
-import re
 from git import Repo
 import requests
 from langchain_openai import ChatOpenAI
 from langchain.schema import HumanMessage
+import re
 
 # ----------------- CONFIG -----------------
 repo_dir = os.getcwd()
@@ -28,49 +28,20 @@ repo.git.checkout(main_branch)
 with open(main_file, "r") as f:
     main_code = f.read()
 
-# ----------------- INSERT UNIQUE PLACEHOLDER -----------------
-def insert_unique_placeholder(code, description="placeholder"):
-    section_id = uuid.uuid4().hex[:8]
-    marker_start = f"### UPDATED START {section_id} ###"
-    marker_end = f"### UPDATED END {section_id} ###"
+# ----------------- CALL GPT TO GENERATE CHANGES -----------------
+generate_prompt = f"""
+You are a Python developer.
 
-    pattern = r"(uploaded_file\s*=\s*st\.file_uploader\(.*\))"
-    if re.search(pattern, code):
-        code = re.sub(
-            pattern,
-            f"{marker_start}\n# {description}\n\\1\n{marker_end}",
-            code
-        )
-    else:
-        code += f"\n{marker_start}\n# {description}\n{marker_end}\n"
-    return code, section_id
+Analyze the following main.py file and generate necessary code modifications
+based on this issue:
 
-main_code, section_id = insert_unique_placeholder(main_code)
+Issue Title: {issue_title}
+Issue Body: {issue_body}
 
-with open(main_file, "w") as f:
-    f.write(main_code)
-
-# ----------------- EXTRACT SECTION TO UPDATE -----------------
-pattern = rf"### UPDATED START {section_id} ###(.*?)### UPDATED END {section_id} ###"
-sections_to_update = re.findall(pattern, main_code, flags=re.S)
-
-if not sections_to_update:
-    print("No sections found to update. Exiting.")
-    exit(0)
-
-gpt_prompt = f"""
-Issue: {issue_title}
-Description: {issue_body}
-
-Only provide updates for the marked section below.
-Return ONLY valid Python code inside triple backticks.
-Do NOT return full main.py.
+Return only the modifications as valid Python code inside triple backticks.
+Do NOT return the full main.py.
 """
 
-for section in sections_to_update:
-    gpt_prompt += f"\n### SECTION ###\n{section.strip()}\n"
-
-# ----------------- CALL GPT VIA LangChain -----------------
 try:
     chat_model = ChatOpenAI(
         temperature=0,
@@ -80,48 +51,79 @@ try:
     )
 
     response = chat_model([
-        HumanMessage(content="You are a Python developer. Update the marked code sections only."),
-        HumanMessage(content=gpt_prompt)
+        HumanMessage(content=generate_prompt)
     ])
-
-    updated_text = response.content.strip()
+    modifications = response.content.strip()
 
 except Exception as e:
-    print(f"❌ GPT analysis failed: {e}")
+    print(f"❌ GPT generation failed: {e}")
     exit(1)
 
-# ----------------- WRITE changes.py -----------------
+# ----------------- WRITE modifications TO changes.py -----------------
 with open(changes_file, "w") as f:
-    f.write(updated_text + "\n")
+    f.write(modifications + "\n")
 
-# ----------------- MERGE UPDATES INTO main.py -----------------
-# Extract Python code block(s) from GPT response
-code_blocks = re.findall(r"```(?:python)?(.*?)```", updated_text, flags=re.S)
+# ----------------- MERGE changes.py INTO main.py -----------------
+# Read changes.py
+with open(changes_file, "r") as f:
+    changes_code = f.read()
 
-if not code_blocks:
-    print("❌ No code block found in GPT output.")
+# If empty, nothing to merge
+if not changes_code.strip():
+    print("⚠️ changes.py is empty. Nothing to merge.")
+    exit(0)
+
+# Ask GPT to merge intelligently
+merge_prompt = f"""
+You are a Python developer.
+
+Merge the following changes into main.py intelligently.
+
+--- main.py ---
+{main_code}
+
+--- changes.py ---
+{changes_code}
+
+Instructions:
+- Integrate the changes into the appropriate place(s) in main.py.
+- Preserve all existing functionality.
+- Return ONLY the final Python code inside triple backticks.
+"""
+
+try:
+    merge_response = chat_model([
+        HumanMessage(content=merge_prompt)
+    ])
+    merged_text = merge_response.content.strip()
+
+except Exception as e:
+    print(f"❌ GPT merge failed: {e}")
     exit(1)
 
-# Merge the first code block into main.py
-updated_section = code_blocks[0].strip()
-main_code = re.sub(
-    pattern,
-    f"### UPDATED START {section_id} ###\n{updated_section}\n### UPDATED END {section_id} ###",
-    main_code,
-    flags=re.S
-)
+# Extract Python code block from GPT response
+code_blocks = re.findall(r"```(?:python)?(.*?)```", merged_text, flags=re.S)
+if not code_blocks:
+    print("❌ No code block returned by GPT for merge.")
+    exit(1)
 
+final_code = code_blocks[0].strip()
+
+# Write final merged code to main.py
 with open(main_file, "w") as f:
-    f.write(main_code)
+    f.write(final_code)
+
+print("✅ main.py successfully merged with changes.py")
 
 # ----------------- CREATE NEW BRANCH -----------------
 branch_name = f"issue-{uuid.uuid4().hex[:8]}"
+repo.git.checkout(main_branch)
 repo.git.checkout("-b", branch_name)
 
 # ----------------- COMMIT & PUSH -----------------
 repo.git.add(all=True)
-repo.git.commit("-m", f"Auto-update for issue: {issue_title}")
-repo.git.push("origin", branch_name)
+repo.git.commit("-m", f"Auto-merge changes for issue: {issue_title}")
+repo.git.push("--set-upstream", "origin", branch_name)
 
 # ----------------- CREATE PULL REQUEST -----------------
 pr_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/pulls"
