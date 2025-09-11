@@ -421,7 +421,30 @@ st.markdown("Upload a PostgreSQL log file")
 
 
 
+### UPDATED START 774305a8 ###
+# placeholder
 uploaded_file = st.file_uploader("📁 Upload a .txt, .pdf, or .docx file", type=["txt", "pdf", "docx"])
+
+# Search box for filtering logs
+search_keyword = st.text_input("Search logs:")
+
+# Filter logs based on search keyword
+if search_keyword:
+    filtered_logs = [log for log in logs if search_keyword.lower() in log.lower()]
+else:
+    filtered_logs = logs
+
+# Display filtered logs with existing color formatting
+for log in filtered_logs:
+    if "ERROR" in log:
+        st.markdown(f"<span style='color:red'>{log}</span>", unsafe_allow_html=True)
+    elif "WARNING" in log:
+        st.markdown(f"<span style='color:orange'>{log}</span>", unsafe_allow_html=True)
+    elif "INFO" in log:
+        st.markdown(f"<span style='color:green'>{log}</span>", unsafe_allow_html=True)
+    else:
+        st.markdown(log)
+### UPDATED END 774305a8 ###
 
 # Function to color log messages based on their level
 def color_log_message(level, message):
