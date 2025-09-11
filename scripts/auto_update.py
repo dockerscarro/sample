@@ -1,9 +1,11 @@
+# scripts/auto_update.py
 import os
-import openai
-from git import Repo
 import uuid
 import re
+from git import Repo
 import requests
+from langchain.chat_models import ChatOpenAI
+from langchain.schema import HumanMessage
 
 # ----------------- CONFIG -----------------
 repo_dir = os.getcwd()
@@ -11,7 +13,7 @@ main_branch = "main"
 main_file = "main.py"
 changes_file = "changes.py"
 
-openai.api_key = os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GH_PAT = os.getenv("GH_PAT")
 repo_owner, repo_name = os.getenv("GITHUB_REPOSITORY").split("/")
 issue_title = os.getenv("ISSUE_TITLE")
@@ -32,7 +34,7 @@ def insert_unique_placeholder(code, description="placeholder"):
     section_id = uuid.uuid4().hex[:8]
     marker_start = f"### UPDATED START {section_id} ###"
     marker_end = f"### UPDATED END {section_id} ###"
-    
+
     pattern = r"(uploaded_file\s*=\s*st\.file_uploader\(.*\))"
     if re.search(pattern, code):
         code = re.sub(
@@ -42,7 +44,6 @@ def insert_unique_placeholder(code, description="placeholder"):
         )
     else:
         code += f"\n{marker_start}\n# {description}\n{marker_end}\n"
-    
     return code, section_id
 
 main_code, section_id = insert_unique_placeholder(main_code)
@@ -58,7 +59,7 @@ if not sections_to_update:
     print("No sections found to update. Exiting.")
     exit(0)
 
-prompt = f"""
+gpt_prompt = f"""
 Issue: {issue_title}
 Description: {issue_body}
 
@@ -68,19 +69,26 @@ Do NOT return full main.py.
 """
 
 for section in sections_to_update:
-    prompt += f"\n### SECTION ###\n{section.strip()}\n"
+    gpt_prompt += f"\n### SECTION ###\n{section.strip()}\n"
 
-# ----------------- CALL OPENAI -----------------
+# ----------------- CALL GPT VIA LangChain -----------------
 try:
-    response = openai.chat.completions.create(
+    chat_model = ChatOpenAI(
+        temperature=0,
         model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
+        openai_api_key=OPENAI_API_KEY,
+        max_tokens=1500
     )
-    updated_text = response.choices[0].message.content.strip()
 
-except (openai.APIConnectionError, openai.RateLimitError, openai.InvalidRequestError) as e:
-    print(f"OpenAI API error: {e}")
+    response = chat_model([
+        HumanMessage(content="You are a Python developer. Update the marked code sections only."),
+        HumanMessage(content=gpt_prompt)
+    ])
+
+    updated_text = response.content.strip()
+
+except Exception as e:
+    print(f"❌ GPT analysis failed: {e}")
     exit(1)
 
 # ----------------- WRITE changes.py -----------------
