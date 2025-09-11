@@ -9,7 +9,7 @@ import re
 repo_dir = os.getcwd()
 main_branch = "main"
 target_file = "main.py"           # only main.py exists
-changes_file = "changes.py"       # contains markers for reference
+changes_file = "changes.py"       # will store OpenAI updates
 
 openai.api_key = os.getenv("OPENAI_API_KEY")
 GH_PAT = os.getenv("GH_PAT")
@@ -23,7 +23,7 @@ repo.git.config("user.name", "github-actions[bot]")
 repo.git.config("user.email", "github-actions[bot]@users.noreply.github.com")
 repo.git.checkout(main_branch)
 
-# ----------------- READ EXISTING FILE -----------------
+# ----------------- READ MAIN FILE -----------------
 with open(target_file, "r") as f:
     main_code = f.read()
 
@@ -60,25 +60,27 @@ updated_text = response.choices[0].message.content.strip()
 with open(changes_file, "w") as f:
     f.write(updated_text)
 
-# ----------------- MERGE INTO MAIN.PY (remove markers) -----------------
+# ----------------- REMOVE MARKERS -----------------
 def remove_markers(code_with_markers):
-    # Keep only code inside markers, remove marker lines
+    pattern = r"### UPDATED START ###[\s\S]*?### UPDATED END ###"
     def repl(match):
-        inner_code = match.group(0).split("\n", 2)[1].rsplit("\n", 1)[0]
-        return inner_code
-    return re.sub(r"### UPDATED START ###[\s\S]*?### UPDATED END ###", repl, code_with_markers)
+        # Keep everything between markers, remove marker lines
+        inner = match.group(0).split("\n")[1:-1]
+        return "\n".join(inner)
+    return re.sub(pattern, repl, code_with_markers)
 
-merged_code = remove_markers(updated_text)
-# Merge changes into main_code
-# Simple approach: replace code between markers if it already exists, else append at end
-if "### UPDATED START ###" in main_code:
-    # replace old updated section
-    main_code_cleaned = re.sub(r"### UPDATED START ###[\s\S]*?### UPDATED END ###", merged_code, main_code)
+cleaned_update = remove_markers(updated_text)
+
+# ----------------- MERGE INTO MAIN.PY -----------------
+# If main.py already has old updated section, replace it
+pattern = r"### UPDATED START ###[\s\S]*?### UPDATED END ###"
+if re.search(pattern, main_code):
+    main_code_new = re.sub(pattern, cleaned_update, main_code)
 else:
-    main_code_cleaned = main_code + "\n\n" + merged_code
+    main_code_new = main_code + "\n\n" + cleaned_update
 
 with open(target_file, "w") as f:
-    f.write(main_code_cleaned)
+    f.write(main_code_new)
 
 # ----------------- CREATE NEW BRANCH -----------------
 branch_name = f"issue-{uuid.uuid4().hex[:8]}"
