@@ -1,11 +1,10 @@
 import os
 import uuid
+import re
 from git import Repo
 import requests
 from langchain_openai import ChatOpenAI
 from langchain.schema import HumanMessage
-from difflib import SequenceMatcher
-import re
 
 # ----------------- CONFIG -----------------
 repo_dir = os.getcwd()
@@ -29,14 +28,47 @@ repo.git.checkout(main_branch)
 with open(main_file, "r") as f:
     main_code = f.read()
 
-# ----------------- PREPARE GPT PROMPT -----------------
+# ----------------- INSERT UNIQUE PLACEHOLDER -----------------
+def insert_unique_placeholder(code, description="placeholder"):
+    section_id = uuid.uuid4().hex[:8]
+    marker_start = f"### UPDATED START {section_id} ###"
+    marker_end = f"### UPDATED END {section_id} ###"
+
+    pattern = r"(uploaded_file\s*=\s*st\.file_uploader\(.*\))"
+    if re.search(pattern, code):
+        code = re.sub(
+            pattern,
+            f"{marker_start}\n# {description}\n\\1\n{marker_end}",
+            code
+        )
+    else:
+        code += f"\n{marker_start}\n# {description}\n{marker_end}\n"
+    return code, section_id
+
+main_code, section_id = insert_unique_placeholder(main_code)
+
+with open(main_file, "w") as f:
+    f.write(main_code)
+
+# ----------------- EXTRACT SECTION TO UPDATE -----------------
+pattern = rf"### UPDATED START {section_id} ###(.*?)### UPDATED END {section_id} ###"
+sections_to_update = re.findall(pattern, main_code, flags=re.S)
+
+if not sections_to_update:
+    print("No sections found to update. Exiting.")
+    exit(0)
+
 gpt_prompt = f"""
 Issue: {issue_title}
 Description: {issue_body}
 
-Provide ONLY valid Python code inside triple backticks.
-Do NOT return full main.py. Only the code that should be updated or added.
+Only provide updates for the marked section below.
+Return ONLY valid Python code inside triple backticks.
+Do NOT return full main.py.
 """
+
+for section in sections_to_update:
+    gpt_prompt += f"\n### SECTION ###\n{section.strip()}\n"
 
 # ----------------- CALL GPT VIA LangChain -----------------
 try:
@@ -48,7 +80,7 @@ try:
     )
 
     response = chat_model([
-        HumanMessage(content="You are a Python developer. Update or add only the necessary code."),
+        HumanMessage(content="You are a Python developer. Update the marked code sections only."),
         HumanMessage(content=gpt_prompt)
     ])
 
@@ -62,27 +94,23 @@ except Exception as e:
 with open(changes_file, "w") as f:
     f.write(updated_text + "\n")
 
-# ----------------- MERGE CHANGES INTO main.py -----------------
+# ----------------- MERGE UPDATES INTO main.py -----------------
 # Extract Python code block(s) from GPT response
 code_blocks = re.findall(r"```(?:python)?(.*?)```", updated_text, flags=re.S)
+
 if not code_blocks:
     print("❌ No code block found in GPT output.")
     exit(1)
 
-changes_lines = code_blocks[0].strip().splitlines()
-main_lines = main_code.splitlines()
-matcher = SequenceMatcher(None, main_lines, changes_lines)
+# Merge the first code block into main.py
+updated_section = code_blocks[0].strip()
+main_code = re.sub(
+    pattern,
+    f"### UPDATED START {section_id} ###\n{updated_section}\n### UPDATED END {section_id} ###",
+    main_code,
+    flags=re.S
+)
 
-merged_lines = []
-for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-    if tag == 'equal':
-        merged_lines.extend(main_lines[i1:i2])
-    elif tag in ('replace', 'delete', 'insert'):
-        # Replace or insert with GPT lines
-        merged_lines.extend(changes_lines[j1:j2])
-
-# Save merged main.py
-main_code = "\n".join(merged_lines) + "\n"
 with open(main_file, "w") as f:
     f.write(main_code)
 
