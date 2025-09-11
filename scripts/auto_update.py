@@ -47,7 +47,7 @@ prompt = f"""
 Issue: {issue_title}
 Description: {issue_body}
 
-Below are multiple Python files that together make up the project. 
+Below are Python files that make up the project. 
 Please update ONLY the changed files as needed to resolve the issue. 
 Important rules:
 - Always return FULL UPDATED FILES, not snippets.
