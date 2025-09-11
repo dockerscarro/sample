@@ -1,6 +1,6 @@
 import os
-import re
 import uuid
+import re
 from git import Repo
 import requests
 from langchain_openai import ChatOpenAI
@@ -28,52 +28,59 @@ repo.git.checkout(main_branch)
 with open(main_file, "r") as f:
     main_code = f.read()
 
-# ----------------- DETECT INSERTION POINTS -----------------
-# 1️⃣ Imports
-imports_end = 0
-for match in re.finditer(r'^(import .*|from .+ import .+)', main_code, flags=re.M):
-    imports_end = match.end()
+# ----------------- INSERT UNIQUE PLACEHOLDER -----------------
+def insert_unique_placeholder(code, description="placeholder"):
+    section_id = uuid.uuid4().hex[:8]
+    marker_start = f"### UPDATED START {section_id} ###"
+    marker_end = f"### UPDATED END {section_id} ###"
 
-# 2️⃣ Functions
-functions_end = imports_end
-func_matches = list(re.finditer(r'^def .+:\s*$', main_code, flags=re.M))
-if func_matches:
-    last_func = func_matches[-1]
-    # Find end of function body by detecting indentation change or next def
-    func_body = main_code[last_func.start():]
-    next_def = re.search(r'^\S', func_body, flags=re.M)
-    if next_def:
-        functions_end = last_func.start() + next_def.start()
+    pattern = r"(uploaded_file\s*=\s*st\.file_uploader\(.*\))"
+    if re.search(pattern, code):
+        code = re.sub(
+            pattern,
+            f"{marker_start}\n# {description}\n\\1\n{marker_end}",
+            code
+        )
     else:
-        functions_end = len(main_code)
+        code += f"\n{marker_start}\n# {description}\n{marker_end}\n"
+    return code, section_id
 
-# ----------------- PREPARE PROMPT -----------------
+main_code, section_id = insert_unique_placeholder(main_code)
+
+with open(main_file, "w") as f:
+    f.write(main_code)
+
+# ----------------- EXTRACT SECTION TO UPDATE -----------------
+pattern = rf"### UPDATED START {section_id} ###(.*?)### UPDATED END {section_id} ###"
+sections_to_update = re.findall(pattern, main_code, flags=re.S)
+
+if not sections_to_update:
+    print("No sections found to update. Exiting.")
+    exit(0)
+
 gpt_prompt = f"""
 Issue: {issue_title}
 Description: {issue_body}
 
-Only provide updates for main.py content.
-- Do NOT touch imports at the top.
-- Do NOT remove existing functions.
-- If new functions are needed, place after existing functions.
-- If modifying main Streamlit logic, place after functions.
-- Return ONLY valid Python code inside triple backticks.
+Only provide updates for the marked section below.
+Return ONLY valid Python code inside triple backticks.
+Do NOT return full main.py.
 """
 
-# Send current main.py content so GPT can know where to merge
-gpt_prompt += f"\n\nCURRENT CODE:\n```\n{main_code}\n```"
+for section in sections_to_update:
+    gpt_prompt += f"\n### SECTION ###\n{section.strip()}\n"
 
-# ----------------- CALL GPT -----------------
+# ----------------- CALL GPT VIA LangChain -----------------
 try:
     chat_model = ChatOpenAI(
         temperature=0,
         model="gpt-4o-mini",
         openai_api_key=OPENAI_API_KEY,
-        max_tokens=2000
+        max_tokens=1500
     )
 
     response = chat_model([
-        HumanMessage(content="You are a Python developer. Update main.py according to the issue without breaking its structure."),
+        HumanMessage(content="You are a Python developer. Update the marked code sections only."),
         HumanMessage(content=gpt_prompt)
     ])
 
@@ -83,21 +90,29 @@ except Exception as e:
     print(f"❌ GPT analysis failed: {e}")
     exit(1)
 
-# ----------------- EXTRACT CODE -----------------
+# ----------------- WRITE changes.py -----------------
+with open(changes_file, "w") as f:
+    f.write(updated_text + "\n")
+
+# ----------------- MERGE UPDATES INTO main.py -----------------
+# Extract Python code block(s) from GPT response
 code_blocks = re.findall(r"```(?:python)?(.*?)```", updated_text, flags=re.S)
+
 if not code_blocks:
     print("❌ No code block found in GPT output.")
     exit(1)
 
-new_code = code_blocks[0].strip()
+# Merge the first code block into main.py
+updated_section = code_blocks[0].strip()
+main_code = re.sub(
+    pattern,
+    f"### UPDATED START {section_id} ###\n{updated_section}\n### UPDATED END {section_id} ###",
+    main_code,
+    flags=re.S
+)
 
-# ----------------- WRITE changes.py -----------------
-with open(changes_file, "w") as f:
-    f.write(new_code + "\n")
-
-# ----------------- OVERWRITE main.py -----------------
 with open(main_file, "w") as f:
-    f.write(new_code + "\n")
+    f.write(main_code)
 
 # ----------------- CREATE NEW BRANCH -----------------
 branch_name = f"issue-{uuid.uuid4().hex[:8]}"
