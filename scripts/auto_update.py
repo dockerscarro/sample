@@ -18,6 +18,8 @@ repo_owner, repo_name = os.getenv("GITHUB_REPOSITORY").split("/")
 issue_title = os.getenv("ISSUE_TITLE")
 issue_body = os.getenv("ISSUE_BODY")
 
+MAX_RETRIES = 5  # Retry GPT merge until fully valid
+
 # ----------------- GIT SETUP -----------------
 repo = Repo(repo_dir)
 repo.git.config("user.name", "github-actions[bot]")
@@ -46,17 +48,16 @@ Generate ONLY the modifications needed to address this issue.
 - Return ONLY valid Python code inside triple backticks (no explanations).
 """
 
-try:
-    chat_model = ChatOpenAI(
-        temperature=0,
-        model="gpt-4o-mini",
-        openai_api_key=OPENAI_API_KEY,
-        max_tokens=1500
-    )
+chat_model = ChatOpenAI(
+    temperature=0,
+    model="gpt-4o-mini",
+    openai_api_key=OPENAI_API_KEY,
+    max_tokens=1500
+)
 
+try:
     response = chat_model.invoke([HumanMessage(content=generate_changes_prompt)])
     changes_code = response.content.strip()
-
 except Exception as e:
     print(f"❌ GPT failed to generate changes: {e}")
     exit(1)
@@ -71,8 +72,12 @@ if not changes_code.strip():
 
 print("✅ changes.py created successfully.")
 
-# ----------------- STEP 2: MERGE changes.py INTO main.py -----------------
-merge_prompt = f"""
+# ----------------- STEP 2: MERGE INTO COMPLETE main.py -----------------
+retry_count = 0
+merged_successfully = False
+
+while retry_count < MAX_RETRIES:
+    merge_prompt = f"""
 You are an expert Python developer.
 
 Current main.py:
@@ -80,51 +85,50 @@ Current main.py:
 --- main.py ---
 {main_code}
 
-Generated changes:
+Generated changes.py:
 
 --- changes.py ---
 {changes_code}
 
-Merge changes.py into main.py:
-- Integrate new code in correct places.
-- Preserve existing functionality.
-- Remove or replace old code if necessary.
-- The final code MUST be valid Python and executable.
-- Return ONLY the final full updated main.py code inside triple backticks.
+Apply the changes.py modifications to main.py:
+- Return the full, complete, and fully valid Python code of main.py.
+- Make all changes, remove or replace old code if needed.
+- Ensure the final main.py is executable and contains nothing missing.
+- Return ONLY the complete code inside triple backticks.
 - Do NOT include explanations.
 """
+    try:
+        merged_response = chat_model.invoke([HumanMessage(content=merge_prompt)])
+        merged_text = merged_response.content.strip()
+    except Exception as e:
+        print(f"❌ GPT failed to merge changes: {e}")
+        exit(1)
 
-try:
-    merge_response = chat_model.invoke([HumanMessage(content=merge_prompt)])
-    merged_text = merge_response.content.strip()
+    # Extract code from triple backticks
+    code_blocks = re.findall(r"```(?:python)?\s*(.*?)```", merged_text, flags=re.S)
+    if code_blocks:
+        final_code = code_blocks[0].strip()
+    else:
+        # fallback: remove any leading/trailing backticks
+        final_code = "\n".join(
+            line for line in merged_text.splitlines() if not line.strip().startswith("```")
+        ).strip()
 
-except Exception as e:
-    print(f"❌ GPT failed to merge changes: {e}")
-    exit(1)
+    # Remove any invisible/non-ASCII characters
+    final_code = re.sub(r"[^\x09\x0A\x0D\x20-\x7E]+", "", final_code)
 
-# ----------------- EXTRACT FINAL UPDATED CODE -----------------
-code_blocks = re.findall(r"```(?:python)?\s*(.*?)```", merged_text, flags=re.S)
-if code_blocks:
-    final_code = code_blocks[0].strip()
-else:
-    # fallback: remove any leading/trailing non-code lines
-    final_code = "\n".join(
-        line for line in merged_text.splitlines() 
-        if not line.strip().startswith("```")
-    ).strip()
+    # Syntax check
+    try:
+        compile(final_code, main_file, "exec")
+        merged_successfully = True
+        print(f"✅ main.py merged successfully on attempt {retry_count + 1}")
+        break
+    except SyntaxError as e:
+        print(f"⚠️ Syntax error detected: {e}. Retrying GPT merge ({retry_count + 1}/{MAX_RETRIES})...")
+        retry_count += 1
 
-if not final_code:
-    print("❌ GPT returned empty merged code. Exiting.")
-    exit(1)
-
-# ----------------- CLEAN EXTRA NON-CODE CHARACTERS -----------------
-final_code = re.sub(r"[^\x09\x0A\x0D\x20-\x7E]+", "", final_code)
-
-# ----------------- SYNTAX CHECK -----------------
-try:
-    compile(final_code, main_file, "exec")
-except SyntaxError as e:
-    print(f"❌ GPT returned code with syntax errors: {e}")
+if not merged_successfully:
+    print("❌ Failed to generate fully valid main.py after multiple retries.")
     with open("failed_gpt_output.py", "w") as f:
         f.write(final_code)
     exit(1)
@@ -132,8 +136,6 @@ except SyntaxError as e:
 # ----------------- WRITE UPDATED main.py -----------------
 with open(main_file, "w") as f:
     f.write(final_code)
-
-print("✅ main.py successfully merged and validated")
 
 # ----------------- CREATE NEW BRANCH -----------------
 branch_name = f"issue-{uuid.uuid4().hex[:8]}"
