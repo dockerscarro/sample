@@ -418,6 +418,8 @@ st.set_page_config(page_title="Hybrid Log Search", layout="wide")
 st.title("📚 Hybrid Log Search (Qdrant) ")
 st.markdown("Upload a PostgreSQL log file")
 
+### UPDATED START 824e73d8 ###
+# File uploader placeholder
 uploaded_file = st.file_uploader("📁 Upload a .txt, .pdf, or .docx file", type=["txt", "pdf", "docx"])
 
 if uploaded_file:
@@ -596,3 +598,12 @@ if search_clicked and query and st.session_state.get("indexed"):
 
         except Exception as e:
             st.error(f"❌ GPT analysis failed: {e}")
+### UPDATED END 824e73d8 ###
+
+### UPDATED START 504a7615 ###
+# Color log function
+### UPDATED END 504a7615 ###
+
+### UPDATED START 0ce14625 ###
+# Log display loop
+### UPDATED END 0ce14625 ###
