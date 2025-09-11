@@ -9,12 +9,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1️⃣ Checkout the repository using GH_PAT
+      # 1️⃣ Checkout repository using GH_PAT
       - name: Checkout repo
         uses: actions/checkout@v3
         with:
           token: ${{ secrets.GH_PAT }}
-          fetch-depth: 0   # full git history for branch creation and PRs
 
       # 2️⃣ Set Git identity for committing
       - name: Set Git identity
@@ -31,7 +30,7 @@ jobs:
       # 4️⃣ Install dependencies
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
+          pip install --upgrade pip
           pip install openai gitpython requests
 
       # 5️⃣ Run the auto-update Python script
