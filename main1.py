@@ -99,7 +99,7 @@ def load_and_parse_file(uploaded_file):
     elif suffix == ".docx":
         loader = Docx2txtLoader(tmp_path)
     else:
-        st.error("Unsupported file format.")
+        st.sidebar.error("Unsupported file format.")
         return []
 
     documents = loader.load()
