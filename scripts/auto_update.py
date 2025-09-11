@@ -28,9 +28,14 @@ repo.git.checkout(main_branch)
 with open(main_file, "r") as f:
     main_code = f.read()
 
-# Ensure changes.py exists and has content
-if not os.path.exists(changes_file) or not os.path.getsize(changes_file):
-    print("❌ changes.py is missing or empty. Nothing to merge.")
+# Ensure changes.py exists
+if not os.path.exists(changes_file):
+    with open(changes_file, "w") as f:
+        f.write("")
+
+# Skip merge if changes.py is empty
+if os.path.getsize(changes_file) == 0:
+    print("⚠️ changes.py is empty. Nothing to merge.")
     exit(0)
 
 with open(changes_file, "r") as f:
