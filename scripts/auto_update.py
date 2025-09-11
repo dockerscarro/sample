@@ -28,12 +28,13 @@ repo.git.checkout(main_branch)
 with open(main_file, "r") as f:
     main_code = f.read()
 
+# Ensure changes.py exists and has content
+if not os.path.exists(changes_file) or not os.path.getsize(changes_file):
+    print("❌ changes.py is missing or empty. Nothing to merge.")
+    exit(0)
+
 with open(changes_file, "r") as f:
     changes_code = f.read()
-
-if not changes_code.strip():
-    print("❌ changes.py is empty. Nothing to merge.")
-    exit(0)
 
 # ----------------- PREPARE GPT PROMPT -----------------
 gpt_prompt = f"""
