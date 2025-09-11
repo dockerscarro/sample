@@ -38,8 +38,8 @@ based on this issue:
 Issue Title: {issue_title}
 Issue Body: {issue_body}
 
-Return only the modifications as valid Python code inside triple backticks.
-Do NOT return the full main.py.
+Return only the modifications as valid Python code. Preferably use triple backticks
+with python, but if not, just the code is fine.
 """
 
 try:
@@ -50,9 +50,7 @@ try:
         max_tokens=1500
     )
 
-    response = chat_model([
-        HumanMessage(content=generate_prompt)
-    ])
+    response = chat_model.invoke([HumanMessage(content=generate_prompt)])
     modifications = response.content.strip()
 
 except Exception as e:
@@ -64,16 +62,13 @@ with open(changes_file, "w") as f:
     f.write(modifications + "\n")
 
 # ----------------- MERGE changes.py INTO main.py -----------------
-# Read changes.py
 with open(changes_file, "r") as f:
     changes_code = f.read()
 
-# If empty, nothing to merge
 if not changes_code.strip():
     print("⚠️ changes.py is empty. Nothing to merge.")
     exit(0)
 
-# Ask GPT to merge intelligently
 merge_prompt = f"""
 You are a Python developer.
 
@@ -88,28 +83,25 @@ Merge the following changes into main.py intelligently.
 Instructions:
 - Integrate the changes into the appropriate place(s) in main.py.
 - Preserve all existing functionality.
-- Return ONLY the final Python code inside triple backticks.
+- Return ONLY the final Python code. Preferably inside triple backticks.
 """
 
 try:
-    merge_response = chat_model([
-        HumanMessage(content=merge_prompt)
-    ])
+    merge_response = chat_model.invoke([HumanMessage(content=merge_prompt)])
     merged_text = merge_response.content.strip()
 
 except Exception as e:
     print(f"❌ GPT merge failed: {e}")
     exit(1)
 
-# Extract Python code block from GPT response
+# ----------------- EXTRACT FINAL CODE -----------------
+# Try triple backticks first, fallback to entire response
 code_blocks = re.findall(r"```(?:python)?(.*?)```", merged_text, flags=re.S)
 if not code_blocks:
-    print("❌ No code block returned by GPT for merge.")
-    exit(1)
+    code_blocks = [merged_text]
 
 final_code = code_blocks[0].strip()
 
-# Write final merged code to main.py
 with open(main_file, "w") as f:
     f.write(final_code)
 
