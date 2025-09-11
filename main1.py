@@ -85,7 +85,6 @@ def ensure_table_exists():
         conn.commit()
     conn.close()
 
-
 def load_and_parse_file(uploaded_file):
     suffix = os.path.splitext(uploaded_file.name)[-1].lower()
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -99,7 +98,7 @@ def load_and_parse_file(uploaded_file):
     elif suffix == ".docx":
         loader = Docx2txtLoader(tmp_path)
     else:
-        st.error("Unsupported file format.")
+        st.sidebar.error("Unsupported file format.")
         return []
 
     documents = loader.load()
