@@ -1,11 +1,9 @@
 import os
-import re
-import uuid
-import time
-import requests
-from git import Repo
 import openai
-from openai.error import APIConnectionError, RateLimitError, InvalidRequestError
+from git import Repo
+import uuid
+import re
+import requests
 
 # ----------------- CONFIG -----------------
 repo_dir = os.getcwd()
@@ -34,7 +32,7 @@ def insert_unique_placeholder(code, description="placeholder"):
     section_id = uuid.uuid4().hex[:8]
     marker_start = f"### UPDATED START {section_id} ###"
     marker_end = f"### UPDATED END {section_id} ###"
-
+    
     pattern = r"(uploaded_file\s*=\s*st\.file_uploader\(.*\))"
     if re.search(pattern, code):
         code = re.sub(
@@ -55,6 +53,7 @@ with open(main_file, "w") as f:
 # ----------------- EXTRACT SECTION TO UPDATE -----------------
 pattern = rf"### UPDATED START {section_id} ###(.*?)### UPDATED END {section_id} ###"
 sections_to_update = re.findall(pattern, main_code, flags=re.S)
+
 if not sections_to_update:
     print("No sections found to update. Exiting.")
     exit(0)
@@ -71,28 +70,18 @@ Do NOT return full main.py.
 for section in sections_to_update:
     prompt += f"\n### SECTION ###\n{section.strip()}\n"
 
-# ----------------- CALL OPENAI WITH RETRIES -----------------
-max_retries = 3
-for attempt in range(max_retries):
-    try:
-        response = openai.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0
-        )
-        updated_text = response.choices[0].message.content.strip()
-        break
-    except (APIConnectionError, RateLimitError) as e:
-        print(f"OpenAI API error, retrying ({attempt+1}/{max_retries}): {e}")
-        time.sleep(2 + attempt * 3)
-    except InvalidRequestError as e:
-        print(f"Invalid request: {e}")
-        exit(1)
-    except Exception as e:
-        print(f"Unexpected error: {e}")
-        exit(1)
-else:
-    raise RuntimeError("Failed to call OpenAI API after retries")
+# ----------------- CALL OPENAI -----------------
+try:
+    response = openai.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
+    updated_text = response.choices[0].message.content.strip()
+
+except (openai.APIConnectionError, openai.RateLimitError, openai.InvalidRequestError) as e:
+    print(f"OpenAI API error: {e}")
+    exit(1)
 
 # ----------------- WRITE changes.py -----------------
 with open(changes_file, "w") as f:
