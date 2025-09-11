@@ -1,4 +1,3 @@
-# scripts/auto_update.py
 import os
 import uuid
 import re
@@ -29,55 +28,72 @@ repo.git.checkout(main_branch)
 with open(main_file, "r") as f:
     main_code = f.read()
 
-# ----------------- INSERT UNIQUE PLACEHOLDER -----------------
-def insert_unique_placeholder(code, description="placeholder"):
+# ----------------- AUTO MARK SECTIONS -----------------
+def mark_section(code, pattern, description="placeholder"):
     section_id = uuid.uuid4().hex[:8]
     marker_start = f"### UPDATED START {section_id} ###"
     marker_end = f"### UPDATED END {section_id} ###"
 
-    pattern = r"(uploaded_file\s*=\s*st\.file_uploader\(.*\))"
-    if re.search(pattern, code):
+    if re.search(pattern, code, flags=re.S):
         code = re.sub(
             pattern,
             f"{marker_start}\n# {description}\n\\1\n{marker_end}",
-            code
+            code,
+            flags=re.S
         )
     else:
+        # Append at the end if pattern not found
         code += f"\n{marker_start}\n# {description}\n{marker_end}\n"
+
     return code, section_id
 
-main_code, section_id = insert_unique_placeholder(main_code)
+# Patterns to mark automatically
+patterns_to_mark = [
+    (r"(uploaded_file\s*=\s*st\.file_uploader\(.*\))", "File uploader placeholder"),
+    (r"(def color_log_message\(.*?\):.*?return message\s*)", "Color log function"),
+    (r"(for log in logs:.*?unsafe_allow_html=True\))", "Log display loop")
+]
+
+section_ids = []
+
+for pat, desc in patterns_to_mark:
+    main_code, sid = mark_section(main_code, pat, desc)
+    section_ids.append(sid)
 
 with open(main_file, "w") as f:
     f.write(main_code)
 
-# ----------------- EXTRACT SECTION TO UPDATE -----------------
-pattern = rf"### UPDATED START {section_id} ###(.*?)### UPDATED END {section_id} ###"
-sections_to_update = re.findall(pattern, main_code, flags=re.S)
+# ----------------- EXTRACT SECTIONS -----------------
+sections_to_update = {}
+for sid in section_ids:
+    pattern = rf"### UPDATED START {sid} ###(.*?)### UPDATED END {sid} ###"
+    matches = re.findall(pattern, main_code, flags=re.S)
+    if matches:
+        sections_to_update[sid] = matches[0]
 
 if not sections_to_update:
     print("No sections found to update. Exiting.")
     exit(0)
 
+# ----------------- PREPARE GPT PROMPT -----------------
 gpt_prompt = f"""
 Issue: {issue_title}
 Description: {issue_body}
 
-Only provide updates for the marked section below.
-Return the updated code exactly in the same format with markers.
+Update the marked sections below. Return code only inside markers.
 Do NOT return full main.py.
 """
 
-for section in sections_to_update:
-    gpt_prompt += f"\n### SECTION ###\n{section.strip()}\n"
+for sid, code_block in sections_to_update.items():
+    gpt_prompt += f"\n### SECTION {sid} ###\n{code_block.strip()}\n"
 
-# ----------------- CALL GPT VIA LangChain -----------------
+# ----------------- CALL GPT -----------------
 try:
     chat_model = ChatOpenAI(
         temperature=0,
         model="gpt-4o-mini",
         openai_api_key=OPENAI_API_KEY,
-        max_tokens=1500
+        max_tokens=2000
     )
 
     response = chat_model([
@@ -99,15 +115,17 @@ with open(changes_file, "w") as f:
 branch_name = f"issue-{uuid.uuid4().hex[:8]}"
 repo.git.checkout("-b", branch_name)
 
-# ----------------- MERGE UPDATES INTO main.py -----------------
-updated_sections = re.findall(pattern, updated_text, flags=re.S)
-for updated_section in updated_sections:
-    main_code = re.sub(
-        pattern,
-        f"### UPDATED START {section_id} ###\n{updated_section.strip()}\n### UPDATED END {section_id} ###",
-        main_code,
-        flags=re.S
-    )
+# ----------------- MERGE UPDATES -----------------
+for sid in section_ids:
+    pattern = rf"### UPDATED START {sid} ###(.*?)### UPDATED END {sid} ###"
+    updated_sections = re.findall(pattern, updated_text, flags=re.S)
+    if updated_sections:
+        main_code = re.sub(
+            pattern,
+            f"### UPDATED START {sid} ###\n{updated_sections[0].strip()}\n### UPDATED END {sid} ###",
+            main_code,
+            flags=re.S
+        )
 
 with open(main_file, "w") as f:
     f.write(main_code)
