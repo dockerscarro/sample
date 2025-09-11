@@ -1,0 +1,6 @@
+openai
+gitpython
+requests
+langchain
+langchain-openai
+astor
