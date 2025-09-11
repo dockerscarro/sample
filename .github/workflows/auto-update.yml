@@ -1,4 +1,4 @@
-name: Auto Update main.py for Issues
+name: Auto Update Code for Issues
 
 on:
   issues:
@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1️⃣ Checkout repository
+      # 1️⃣ Checkout repo
       - name: Checkout repo
         uses: actions/checkout@v3
         with:
@@ -27,7 +27,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      # 4️⃣ Install dependencies
+      # 4️⃣ Install dependencies (✅ includes langchain-openai)
       - name: Install dependencies
         run: |
           pip install --upgrade pip
