@@ -1,5 +1,4 @@
-### UPDATED START c1b626ad ###
-# placeholder
+
 import streamlit as st
 import os
 import tempfile
@@ -616,4 +615,4 @@ if search_clicked and query and st.session_state.get("indexed"):
 
         except Exception as e:
             st.error(f"❌ GPT analysis failed: {e}")
-### UPDATED END c1b626ad ###
+
