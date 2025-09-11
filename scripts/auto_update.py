@@ -9,7 +9,7 @@ import re
 repo_dir = os.getcwd()
 main_branch = "main"
 target_files = ["main1.py", "main2.py", "main3.py", "main4.py", "main5.py"]
-merged_file = "main.py"  # full combined code only in new branch
+merged_file = "main.py"  # merged code, only in new branch
 
 openai.api_key = os.getenv("OPENAI_API_KEY")
 GH_PAT = os.getenv("GH_PAT")
@@ -22,70 +22,38 @@ repo = Repo(repo_dir)
 repo.git.config("user.name", "github-actions[bot]")
 repo.git.config("user.email", "github-actions[bot]@users.noreply.github.com")
 repo.git.checkout(main_branch)
-repo.git.fetch("origin", main_branch)
 
-# ----------------- READ ALL SPLIT FILES -----------------
+# ----------------- READ EXISTING FILES -----------------
 files_content = {}
-for f in target_files:
-    with open(f, "r") as file:
-        files_content[f] = file.read()
+for file in target_files:
+    with open(file, "r") as f:
+        files_content[file] = f.read()
 
-# ----------------- DETERMINE FILES THAT NEED CHANGES -----------------
-# Here we do a simple heuristic: OpenAI will get all files, and we ask which files need changes
-# For token efficiency, only changed files are returned by OpenAI
-prompt_detect = f"""
+# ----------------- CREATE OPENAI PROMPT -----------------
+prompt = f"""
 Issue: {issue_title}
 Description: {issue_body}
 
-Below are all Python files in the project. 
-Please identify which files need updates to fix the issue. 
-Return a list of filenames only.
-Do NOT include explanations or code yet.
+Below are multiple Python files that together make up the project. 
+Please update ALL of them as needed to resolve the issue. 
+Important rules:
+- Always return FULL UPDATED FILES, not snippets.
+- Keep the file headers (### FILE: <filename>) exactly as given.
+- Do NOT include Markdown markers like ```.
+
 """
 
 for filename, content in files_content.items():
-    prompt_detect += f"\n### FILE: {filename}\n{content}\n"
+    prompt += f"\n### FILE: {filename}\n{content}\n"
 
-# Call OpenAI to detect changed files
-response_detect = openai.chat.completions.create(
+# ----------------- CALL OPENAI -----------------
+response = openai.chat.completions.create(
     model="gpt-4",
-    messages=[{"role": "user", "content": prompt_detect}],
+    messages=[{"role": "user", "content": prompt}],
     temperature=0
 )
 
-# Parse response as list of files
-changed_files_raw = response_detect.choices[0].message.content.strip().splitlines()
-changed_files = [f.strip() for f in changed_files_raw if f.strip() in target_files]
-
-if not changed_files:
-    print("No files need changes according to OpenAI. Exiting.")
-    exit(0)
-
-print(f"Files to be updated by OpenAI: {changed_files}")
-
-# ----------------- CREATE PROMPT FOR UPDATING FILES -----------------
-prompt_update = f"""
-Issue: {issue_title}
-Description: {issue_body}
-
-Please update ONLY the following Python files to resolve the issue. 
-Return the full updated content for each file.
-Keep file headers exactly as ### FILE: <filename>.
-Do NOT include markdown formatting.
-
-"""
-
-for f in changed_files:
-    prompt_update += f"\n### FILE: {f}\n{files_content[f]}\n"
-
-# Call OpenAI to get updated code
-response_update = openai.chat.completions.create(
-    model="gpt-4",
-    messages=[{"role": "user", "content": prompt_update}],
-    temperature=0
-)
-
-updated_text = response_update.choices[0].message.content.strip()
+updated_text = response.choices[0].message.content.strip()
 
 # ----------------- PARSE UPDATED FILES -----------------
 updated_files = {}
@@ -95,33 +63,29 @@ matches = re.findall(pattern, updated_text)
 for filename, code in matches:
     updated_files[filename.strip()] = code.strip()
 
-# Fallback: keep original content if OpenAI missed a file
-for f in changed_files:
+# Fallback: keep original if model missed a file
+for f in target_files:
     if f not in updated_files:
         updated_files[f] = files_content[f]
 
 # ----------------- CREATE NEW BRANCH -----------------
 branch_name = f"issue-{uuid.uuid4().hex[:8]}"
-print(f"Creating new branch: {branch_name}")
 repo.git.checkout("-b", branch_name)
 
 # ----------------- WRITE UPDATED FILES -----------------
-for filename in target_files:
-    content_to_write = updated_files.get(filename, files_content[filename])
+for filename, code in updated_files.items():
     with open(filename, "w") as f:
-        f.write(content_to_write)
+        f.write(code)
 
-# ----------------- MERGE ALL FILES INTO main.py -----------------
+# ----------------- COMBINE INTO main.py (only in new branch) -----------------
 with open(merged_file, "w") as f:
     for fpart in target_files:
-        with open(fpart, "r") as part_file:
-            f.write(part_file.read() + "\n")
+        f.write(updated_files[fpart] + "\n")
 
 # ----------------- COMMIT & PUSH -----------------
 repo.git.add(all=True)
 repo.git.commit("-m", f"Auto-update for issue: {issue_title}")
-push_result = repo.git.push("origin", branch_name)
-print(push_result)
+repo.git.push("origin", branch_name)
 
 # ----------------- CREATE PULL REQUEST -----------------
 pr_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/pulls"
