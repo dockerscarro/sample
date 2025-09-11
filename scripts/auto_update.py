@@ -1,10 +1,11 @@
 import os
-import openai
-from git import Repo
-import uuid
 import re
-import requests
+import uuid
 import time
+import requests
+from git import Repo
+import openai
+from openai.error import APIConnectionError, RateLimitError, InvalidRequestError
 
 # ----------------- CONFIG -----------------
 repo_dir = os.getcwd()
@@ -33,8 +34,7 @@ def insert_unique_placeholder(code, description="placeholder"):
     section_id = uuid.uuid4().hex[:8]
     marker_start = f"### UPDATED START {section_id} ###"
     marker_end = f"### UPDATED END {section_id} ###"
-    
-    # Example: wrap the uploader or append at the end
+
     pattern = r"(uploaded_file\s*=\s*st\.file_uploader\(.*\))"
     if re.search(pattern, code):
         code = re.sub(
@@ -55,7 +55,6 @@ with open(main_file, "w") as f:
 # ----------------- EXTRACT SECTION TO UPDATE -----------------
 pattern = rf"### UPDATED START {section_id} ###(.*?)### UPDATED END {section_id} ###"
 sections_to_update = re.findall(pattern, main_code, flags=re.S)
-
 if not sections_to_update:
     print("No sections found to update. Exiting.")
     exit(0)
@@ -77,15 +76,16 @@ max_retries = 3
 for attempt in range(max_retries):
     try:
         response = openai.chat.completions.create(
-            model="gpt-4o-mini",  # Free-trial compatible
+            model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             temperature=0
         )
+        updated_text = response.choices[0].message.content.strip()
         break
-    except (openai.error.APIConnectionError, openai.error.RateLimitError) as e:
-        print(f"OpenAI API error, retrying... ({attempt+1}/{max_retries}): {e}")
-        time.sleep(2 + attempt * 3)  # incremental backoff
-    except openai.error.InvalidRequestError as e:
+    except (APIConnectionError, RateLimitError) as e:
+        print(f"OpenAI API error, retrying ({attempt+1}/{max_retries}): {e}")
+        time.sleep(2 + attempt * 3)
+    except InvalidRequestError as e:
         print(f"Invalid request: {e}")
         exit(1)
     except Exception as e:
@@ -93,8 +93,6 @@ for attempt in range(max_retries):
         exit(1)
 else:
     raise RuntimeError("Failed to call OpenAI API after retries")
-
-updated_text = response.choices[0].message.content.strip()
 
 # ----------------- WRITE changes.py -----------------
 with open(changes_file, "w") as f:
