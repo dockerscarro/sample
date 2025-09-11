@@ -9,7 +9,7 @@ import re
 repo_dir = os.getcwd()
 main_branch = "main"
 target_files = ["main1.py", "main2.py", "main3.py", "main4.py", "main5.py"]
-merged_file = "main.py"  # merged code, only in new branch
+merged_file = "main.py"  # full merged code in new branch
 
 openai.api_key = os.getenv("OPENAI_API_KEY")
 GH_PAT = os.getenv("GH_PAT")
@@ -28,7 +28,7 @@ repo.git.fetch("origin", main_branch)
 changed_files = []
 for f in target_files:
     diff = repo.git.diff(f"origin/{main_branch}", f)
-    if diff.strip():  # if there is a diff
+    if diff.strip():
         changed_files.append(f)
 
 if not changed_files:
@@ -90,7 +90,7 @@ for filename, code in updated_files.items():
     with open(filename, "w") as f:
         f.write(code)
 
-# ----------------- COMBINE INTO main.py (only in new branch) -----------------
+# ----------------- COMBINE INTO main.py (full file) -----------------
 with open(merged_file, "w") as f:
     for fpart in target_files:
         with open(fpart, "r") as part_file:
