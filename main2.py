@@ -58,13 +58,13 @@ def setup_qdrant(dimension):
 
 def index_texts(texts, batch_size=500):
     if not texts:
-        st.warning("No logs available to index.")
+        st.sidebar.warning("No logs available to index.")
         return
 
     embeddings = embedder.encode(texts, show_progress_bar=True)
 
     if not isinstance(embeddings, np.ndarray) or embeddings.ndim != 2:
-        st.error(f"Unexpected embedding shape: {getattr(embeddings, 'shape', 'None')}")
+        st.sidebar.error(f"Unexpected embedding shape: {getattr(embeddings, 'shape', 'None')}")
         return
 
     ids = [str(uuid.uuid4()) for _ in texts]
@@ -90,4 +90,4 @@ def index_texts(texts, batch_size=500):
     st.session_state.texts = texts
     st.session_state.embeddings = embeddings
     st.session_state.indexed = True
-    st.success(f"✅ Indexed {len(texts)} logs into Qdrant.")
+    st.sidebar.success(f"✅ Indexed {len(texts)} logs into Qdrant.")
