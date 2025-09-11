@@ -1,6 +1,7 @@
 import os
 import uuid
-import re
+import ast
+import astor
 from git import Repo
 import requests
 from langchain_openai import ChatOpenAI
@@ -24,96 +25,45 @@ repo.git.config("user.name", "github-actions[bot]")
 repo.git.config("user.email", "github-actions[bot]@users.noreply.github.com")
 repo.git.checkout(main_branch)
 
-# ----------------- READ main.py -----------------
+# ----------------- READ main.py AND changes.py -----------------
 with open(main_file, "r") as f:
     main_code = f.read()
 
-# ----------------- INSERT UNIQUE PLACEHOLDER BELOW connect_pg() -----------------
-def insert_below_connect_pg(code, description="placeholder"):
-    section_id = uuid.uuid4().hex[:8]
-    marker_start = f"### UPDATED START {section_id} ###"
-    marker_end = f"### UPDATED END {section_id} ###"
+with open(changes_file, "r") as f:
+    changes_code = f.read()
 
-    pattern = r"(def connect_pg\(.*?\):\s*return\s+psycopg2\.connect\(.*?\))"
-    if re.search(pattern, code, flags=re.S):
-        code = re.sub(
-            pattern,
-            f"\\1\n{marker_start}\n# {description}\n{marker_end}",
-            code,
-            flags=re.S
-        )
-    else:
-        # Fallback: append at the end
-        code += f"\n{marker_start}\n# {description}\n{marker_end}\n"
-    return code, section_id
+# ----------------- AST MERGE FUNCTION -----------------
+def merge_changes_into_main(main_code, changes_code):
+    """
+    Merge changes from changes.py into main.py intelligently using AST.
+    Functions and classes with the same name are replaced. New ones are added.
+    Other code in main.py is preserved.
+    """
+    try:
+        main_tree = ast.parse(main_code)
+        changes_tree = ast.parse(changes_code)
+    except Exception as e:
+        print(f"❌ AST parsing failed: {e}")
+        return main_code
 
-main_code, section_id = insert_below_connect_pg(main_code)
+    # Map top-level names in main.py
+    main_nodes = {node.name: node for node in main_tree.body
+                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
 
-with open(main_file, "w") as f:
-    f.write(main_code)
+    for node in changes_tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            main_nodes[node.name] = node  # Replace or add
 
-# ----------------- EXTRACT SECTION TO UPDATE -----------------
-pattern = rf"### UPDATED START {section_id} ###(.*?)### UPDATED END {section_id} ###"
-sections_to_update = re.findall(pattern, main_code, flags=re.S)
-
-if not sections_to_update:
-    print("No sections found to update. Exiting.")
-    exit(0)
-
-gpt_prompt = f"""
-Issue: {issue_title}
-Description: {issue_body}
-
-Only provide updates for the marked section below.
-Return ONLY valid Python code inside triple backticks.
-Do NOT return full main.py.
-"""
-
-for section in sections_to_update:
-    gpt_prompt += f"\n### SECTION ###\n{section.strip()}\n"
-
-# ----------------- CALL GPT VIA LangChain -----------------
-try:
-    chat_model = ChatOpenAI(
-        temperature=0,
-        model="gpt-4o-mini",
-        openai_api_key=OPENAI_API_KEY,
-        max_tokens=1500
+    # Reconstruct merged tree
+    merged_tree = ast.Module(
+        body=list(main_nodes.values()) + 
+             [n for n in main_tree.body if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))],
+        type_ignores=[]
     )
+    return astor.to_source(merged_tree)
 
-    response = chat_model([
-        HumanMessage(content="You are a Python developer. Update the marked code sections only."),
-        HumanMessage(content=gpt_prompt)
-    ])
-
-    updated_text = response.content.strip()
-
-except Exception as e:
-    # Properly use st.error here
-    import streamlit as st
-    st.error(f"❌ GPT analysis failed: {e}")
-    exit(1)
-
-# ----------------- WRITE changes.py -----------------
-with open(changes_file, "w") as f:
-    f.write(updated_text + "\n")
-
-# ----------------- MERGE UPDATES INTO main.py -----------------
-# Extract Python code block(s) from GPT response
-code_blocks = re.findall(r"```(?:python)?(.*?)```", updated_text, flags=re.S)
-
-if not code_blocks:
-    print("❌ No code block found in GPT output.")
-    exit(1)
-
-# Merge the first code block into main.py
-updated_section = code_blocks[0].strip()
-main_code = re.sub(
-    pattern,
-    f"### UPDATED START {section_id} ###\n{updated_section}\n### UPDATED END {section_id} ###",
-    main_code,
-    flags=re.S
-)
+# ----------------- MERGE CHANGES -----------------
+main_code = merge_changes_into_main(main_code, changes_code)
 
 with open(main_file, "w") as f:
     f.write(main_code)
