@@ -3,7 +3,7 @@ import uuid
 import re
 from git import Repo
 import requests
-from langchain.chat_models import ChatOpenAI
+from langchain_openai import ChatOpenAI
 from langchain.schema import HumanMessage
 
 # ----------------- CONFIG -----------------
@@ -30,27 +30,19 @@ with open(main_file, "r") as f:
 
 # ----------------- INSERT UNIQUE PLACEHOLDER -----------------
 def insert_unique_placeholder(code, description="placeholder"):
-    """
-    Wrap existing code or insert at the end with a unique marker.
-    """
     section_id = uuid.uuid4().hex[:8]
     marker_start = f"### UPDATED START {section_id} ###"
     marker_end = f"### UPDATED END {section_id} ###"
 
-    # Pattern to find code snippet, fallback to placeholder if not found
     pattern = r"(uploaded_file\s*=\s*st\.file_uploader\(.*\))"
-    match = re.search(pattern, code)
-    if match:
-        existing_code = match.group(0)
+    if re.search(pattern, code):
         code = re.sub(
             pattern,
-            f"{marker_start}\n{existing_code}\n{marker_end}",
+            f"{marker_start}\n# {description}\n\\1\n{marker_end}",
             code
         )
     else:
-        existing_code = "# placeholder"
-        code += f"\n{marker_start}\n{existing_code}\n{marker_end}\n"
-
+        code += f"\n{marker_start}\n# {description}\n{marker_end}\n"
     return code, section_id
 
 main_code, section_id = insert_unique_placeholder(main_code)
@@ -71,7 +63,7 @@ Issue: {issue_title}
 Description: {issue_body}
 
 Only provide updates for the marked section below.
-Return the updated code exactly in the same format with markers.
+Return ONLY valid Python code inside triple backticks.
 Do NOT return full main.py.
 """
 
@@ -102,22 +94,29 @@ except Exception as e:
 with open(changes_file, "w") as f:
     f.write(updated_text + "\n")
 
-# ----------------- CREATE NEW BRANCH -----------------
-branch_name = f"issue-{uuid.uuid4().hex[:8]}"
-repo.git.checkout("-b", branch_name)
-
 # ----------------- MERGE UPDATES INTO main.py -----------------
-updated_sections = re.findall(pattern, updated_text, flags=re.S)
-for updated_section in updated_sections:
-    main_code = re.sub(
-        pattern,
-        f"### UPDATED START {section_id} ###\n{updated_section.strip()}\n### UPDATED END {section_id} ###",
-        main_code,
-        flags=re.S
-    )
+# Extract Python code block(s) from GPT response
+code_blocks = re.findall(r"```(?:python)?(.*?)```", updated_text, flags=re.S)
+
+if not code_blocks:
+    print("❌ No code block found in GPT output.")
+    exit(1)
+
+# Merge the first code block into main.py
+updated_section = code_blocks[0].strip()
+main_code = re.sub(
+    pattern,
+    f"### UPDATED START {section_id} ###\n{updated_section}\n### UPDATED END {section_id} ###",
+    main_code,
+    flags=re.S
+)
 
 with open(main_file, "w") as f:
     f.write(main_code)
+
+# ----------------- CREATE NEW BRANCH -----------------
+branch_name = f"issue-{uuid.uuid4().hex[:8]}"
+repo.git.checkout("-b", branch_name)
 
 # ----------------- COMMIT & PUSH -----------------
 repo.git.add(all=True)
