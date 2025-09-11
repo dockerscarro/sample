@@ -10,7 +10,6 @@ import re
 repo_dir = os.getcwd()
 main_branch = "main"
 main_file = "main.py"
-changes_file = "changes.py"
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GH_PAT = os.getenv("GH_PAT")
@@ -28,18 +27,24 @@ repo.git.checkout(main_branch)
 with open(main_file, "r") as f:
     main_code = f.read()
 
-# ----------------- CALL GPT TO GENERATE CHANGES -----------------
-generate_prompt = f"""
-You are a Python developer.
+# ----------------- CALL GPT TO UPDATE main.py -----------------
+update_prompt = f"""
+You are an expert Python developer.
 
-Analyze the following main.py file and generate necessary code modifications
-based on this issue:
+The following is the current main.py code:
 
-Issue Title: {issue_title}
-Issue Body: {issue_body}
+--- main.py ---
+{main_code}
 
-Return only the modifications as valid Python code. Preferably use triple backticks
-with python, but if not, just the code is fine.
+Issue:
+Title: {issue_title}
+Description: {issue_body}
+
+Update main.py to implement the requested changes.
+- Preserve existing functionality.
+- Integrate new code in the most appropriate place.
+- Return ONLY the full updated main.py code inside triple backticks.
+- Do NOT return explanations, only code.
 """
 
 try:
@@ -47,65 +52,29 @@ try:
         temperature=0,
         model="gpt-4o-mini",
         openai_api_key=OPENAI_API_KEY,
-        max_tokens=1500
+        max_tokens=4000
     )
 
-    response = chat_model.invoke([HumanMessage(content=generate_prompt)])
-    modifications = response.content.strip()
+    response = chat_model.invoke([HumanMessage(content=update_prompt)])
+    merged_text = response.content.strip()
 
 except Exception as e:
-    print(f"❌ GPT generation failed: {e}")
+    print(f"❌ GPT update failed: {e}")
     exit(1)
 
-# ----------------- WRITE modifications TO changes.py -----------------
-with open(changes_file, "w") as f:
-    f.write(modifications + "\n")
-
-# ----------------- MERGE changes.py INTO main.py -----------------
-with open(changes_file, "r") as f:
-    changes_code = f.read()
-
-if not changes_code.strip():
-    print("⚠️ changes.py is empty. Nothing to merge.")
-    exit(0)
-
-merge_prompt = f"""
-You are a Python developer.
-
-Merge the following changes into main.py intelligently.
-
---- main.py ---
-{main_code}
-
---- changes.py ---
-{changes_code}
-
-Instructions:
-- Integrate the changes into the appropriate place(s) in main.py.
-- Preserve all existing functionality.
-- Return ONLY the final Python code. Preferably inside triple backticks.
-"""
-
-try:
-    merge_response = chat_model.invoke([HumanMessage(content=merge_prompt)])
-    merged_text = merge_response.content.strip()
-
-except Exception as e:
-    print(f"❌ GPT merge failed: {e}")
-    exit(1)
-
-# ----------------- EXTRACT FINAL CODE -----------------
-# Try triple backticks first, fallback to entire response
+# ----------------- EXTRACT FINAL UPDATED CODE -----------------
+# Try to extract code inside triple backticks
 code_blocks = re.findall(r"```(?:python)?(.*?)```", merged_text, flags=re.S)
 if not code_blocks:
-    code_blocks = [merged_text]
+    code_blocks = [merged_text]  # fallback if GPT didn't use backticks
 
 final_code = code_blocks[0].strip()
 
+# ----------------- WRITE UPDATED main.py -----------------
 with open(main_file, "w") as f:
     f.write(final_code)
 
-print("✅ main.py successfully merged with changes.py")
+print("✅ main.py successfully updated with issue changes.")
 
 # ----------------- CREATE NEW BRANCH -----------------
 branch_name = f"issue-{uuid.uuid4().hex[:8]}"
@@ -114,7 +83,7 @@ repo.git.checkout("-b", branch_name)
 
 # ----------------- COMMIT & PUSH -----------------
 repo.git.add(all=True)
-repo.git.commit("-m", f"Auto-merge changes for issue: {issue_title}")
+repo.git.commit("-m", f"Auto-update main.py for issue: {issue_title}")
 repo.git.push("--set-upstream", "origin", branch_name)
 
 # ----------------- CREATE PULL REQUEST -----------------
@@ -124,7 +93,7 @@ headers = {
     "Accept": "application/vnd.github+json"
 }
 pr_data = {
-    "title": f"Fix: {issue_title}",
+    "title": f"Fix/Update: {issue_title}",
     "head": branch_name,
     "base": main_branch,
     "body": f"Auto-generated update for issue:\n\n{issue_body}"
