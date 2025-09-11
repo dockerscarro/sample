@@ -9,31 +9,26 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1️⃣ Checkout repository using GH_PAT
       - name: Checkout repo
         uses: actions/checkout@v3
         with:
           token: ${{ secrets.GH_PAT }}
 
-      # 2️⃣ Set Git identity for committing
       - name: Set Git identity
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-      # 3️⃣ Set up Python
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
 
-      # 4️⃣ Install dependencies
       - name: Install dependencies
         run: |
           pip install --upgrade pip
           pip install openai gitpython requests
 
-      # 5️⃣ Run the auto-update Python script
       - name: Run auto-update script
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
