@@ -3,6 +3,7 @@ import openai
 from git import Repo
 import uuid
 import re
+import requests
 
 # ----------------- CONFIG -----------------
 repo_dir = os.getcwd()
@@ -26,31 +27,47 @@ repo.git.checkout(main_branch)
 with open(main_file, "r") as f:
     main_code = f.read()
 
-# ----------------- INSERT PLACEHOLDERS (if missing) -----------------
-def ensure_placeholders(code):
-    if "### UPDATED START" not in code:
-        # Example: insert around the uploader
-        pattern = r"(uploaded_file\s*=\s*st\.file_uploader\(.*\))"
-        code = re.sub(pattern,
-                      "### UPDATED START\n# Placeholder for file uploader changes\n\\1\n### UPDATED END",
-                      code)
-    return code
+# ----------------- INSERT UNIQUE PLACEHOLDER -----------------
+def insert_unique_placeholder(code, description="placeholder"):
+    section_id = uuid.uuid4().hex[:8]
+    marker_start = f"### UPDATED START {section_id} ###"
+    marker_end = f"### UPDATED END {section_id} ###"
+    
+    # For example, wrap the uploader or insert at the end
+    pattern = r"(uploaded_file\s*=\s*st\.file_uploader\(.*\))"
+    if re.search(pattern, code):
+        code = re.sub(
+            pattern,
+            f"{marker_start}\n# {description}\n\\1\n{marker_end}",
+            code
+        )
+    else:
+        # Append at the end if pattern not found
+        code += f"\n{marker_start}\n# {description}\n{marker_end}\n"
+    
+    return code, section_id
 
-main_code = ensure_placeholders(main_code)
+main_code, section_id = insert_unique_placeholder(main_code)
 
-# ----------------- EXTRACT SECTIONS TO UPDATE -----------------
-sections_to_update = re.findall(r"### UPDATED START(.*?)### UPDATED END", main_code, flags=re.S)
+# ----------------- WRITE main.py WITH PLACEHOLDER -----------------
+with open(main_file, "w") as f:
+    f.write(main_code)
+
+# ----------------- EXTRACT SECTION TO UPDATE -----------------
+pattern = rf"### UPDATED START {section_id} ###(.*?)### UPDATED END {section_id} ###"
+sections_to_update = re.findall(pattern, main_code, flags=re.S)
+
 if not sections_to_update:
-    print("No sections marked for updates found. Exiting.")
+    print("No sections found to update. Exiting.")
     exit(0)
 
 prompt = f"""
 Issue: {issue_title}
 Description: {issue_body}
 
-Only provide updates for the marked sections below.
-Return the updated code exactly in the same format with ### UPDATED START/END.
-Do NOT return full main.py, only updated sections.
+Only provide updates for the marked section below.
+Return the updated code exactly in the same format with markers.
+Do NOT return full main.py.
 """
 
 for section in sections_to_update:
@@ -74,8 +91,14 @@ branch_name = f"issue-{uuid.uuid4().hex[:8]}"
 repo.git.checkout("-b", branch_name)
 
 # ----------------- MERGE UPDATES INTO main.py -----------------
-for updated_section in re.findall(r"### UPDATED START.*?### UPDATED END", updated_text, flags=re.S):
-    main_code = re.sub(r"### UPDATED START.*?### UPDATED END", updated_section.strip(), main_code, count=1, flags=re.S)
+updated_sections = re.findall(pattern, updated_text, flags=re.S)
+for updated_section in updated_sections:
+    main_code = re.sub(
+        pattern,
+        f"### UPDATED START {section_id} ###\n{updated_section.strip()}\n### UPDATED END {section_id} ###",
+        main_code,
+        flags=re.S
+    )
 
 with open(main_file, "w") as f:
     f.write(main_code)
@@ -86,7 +109,6 @@ repo.git.commit("-m", f"Auto-update for issue: {issue_title}")
 repo.git.push("origin", branch_name)
 
 # ----------------- CREATE PULL REQUEST -----------------
-import requests
 pr_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/pulls"
 headers = {
     "Authorization": f"token {GH_PAT}",
