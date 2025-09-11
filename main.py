@@ -418,7 +418,9 @@ st.set_page_config(page_title="Hybrid Log Search", layout="wide")
 st.title("📚 Hybrid Log Search (Qdrant) ")
 st.markdown("Upload a PostgreSQL log file")
 
+### UPDATED START 65a246a1 ###
 uploaded_file = st.file_uploader("📁 Upload a .txt, .pdf, or .docx file", type=["txt", "pdf", "docx"])
+### UPDATED END 65a246a1 ###
 
 if uploaded_file:
     if "uploaded_file_name" not in st.session_state or st.session_state.uploaded_file_name != uploaded_file.name:
