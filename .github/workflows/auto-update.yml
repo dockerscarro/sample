@@ -51,4 +51,4 @@ jobs:
           ISSUE_TITLE: ${{ github.event.issue.title }}
           ISSUE_BODY: ${{ github.event.issue.body }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-        run: python scripts/update_code.py
+        run: python scripts/auto_update.py
