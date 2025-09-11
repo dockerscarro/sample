@@ -9,25 +9,25 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1️⃣ Checkout repo
+      # 1️⃣ Checkout the repository
       - name: Checkout repo
         uses: actions/checkout@v3
         with:
           token: ${{ secrets.GH_PAT }}
 
-      # 2️⃣ Set Git identity
+      # 2️⃣ Configure Git user for commits
       - name: Set Git identity
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-      # 3️⃣ Setup Python
+      # 3️⃣ Setup Python environment
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
 
-      # 4️⃣ Install dependencies (✅ includes langchain-openai)
+      # 4️⃣ Install dependencies
       - name: Install dependencies
         run: |
           pip install --upgrade pip
@@ -41,4 +41,5 @@ jobs:
           ISSUE_TITLE: ${{ github.event.issue.title }}
           ISSUE_BODY: ${{ github.event.issue.body }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-        run: python scripts/auto_update.py
+        run: |
+          python scripts/auto_update.py
