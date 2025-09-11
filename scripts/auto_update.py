@@ -28,24 +28,26 @@ repo.git.checkout(main_branch)
 with open(main_file, "r") as f:
     main_code = f.read()
 
-# ----------------- INSERT UNIQUE PLACEHOLDER -----------------
-def insert_unique_placeholder(code, description="placeholder"):
+# ----------------- INSERT UNIQUE PLACEHOLDER BELOW connect_pg() -----------------
+def insert_below_connect_pg(code, description="placeholder"):
     section_id = uuid.uuid4().hex[:8]
     marker_start = f"### UPDATED START {section_id} ###"
     marker_end = f"### UPDATED END {section_id} ###"
 
-    pattern = r"(uploaded_file\s*=\s*st\.file_uploader\(.*\))"
-    if re.search(pattern, code):
+    pattern = r"(def connect_pg\(.*?\):\s*return\s+psycopg2\.connect\(.*?\))"
+    if re.search(pattern, code, flags=re.S):
         code = re.sub(
             pattern,
-            f"{marker_start}\n# {description}\n\\1\n{marker_end}",
-            code
+            f"\\1\n{marker_start}\n# {description}\n{marker_end}",
+            code,
+            flags=re.S
         )
     else:
+        # Fallback: append at the end
         code += f"\n{marker_start}\n# {description}\n{marker_end}\n"
     return code, section_id
 
-main_code, section_id = insert_unique_placeholder(main_code)
+main_code, section_id = insert_below_connect_pg(main_code)
 
 with open(main_file, "w") as f:
     f.write(main_code)
@@ -87,7 +89,9 @@ try:
     updated_text = response.content.strip()
 
 except Exception as e:
-    print(f"❌ GPT analysis failed: {e}")
+    # Properly use st.error here
+    import streamlit as st
+    st.error(f"❌ GPT analysis failed: {e}")
     exit(1)
 
 # ----------------- WRITE changes.py -----------------
