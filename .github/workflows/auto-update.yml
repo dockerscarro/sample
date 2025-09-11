@@ -27,12 +27,11 @@ jobs:
         with:
           python-version: '3.11'
 
-      # 4️⃣ Install dependencies
+      # 4️⃣ Install dependencies (✅ includes langchain-openai)
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          # Install all Python dependencies
-          pip install -r requirements.txt
+          pip install openai gitpython requests langchain langchain-openai
 
       # 5️⃣ Run auto-update script
       - name: Run auto-update script
