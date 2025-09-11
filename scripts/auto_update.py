@@ -3,16 +3,14 @@ import openai
 from git import Repo
 import uuid
 import requests
-import re
 
 # ----------------- CONFIG -----------------
 repo_dir = os.getcwd()
 main_branch = "main"
-target_files = ["main1.py", "main2.py", "main3.py", "main4.py", "main5.py"]
-merged_file = "main.py"  # full combined code in new branch
-
-openai.api_key = os.getenv("OPENAI_API_KEY")
+main_file = "main.py"  # full 600+ lines
+changes_file = "changes.py"  # only the modifications
 GH_PAT = os.getenv("GH_PAT")
+openai.api_key = os.getenv("OPENAI_API_KEY")
 repo_owner, repo_name = os.getenv("GITHUB_REPOSITORY").split("/")
 issue_title = os.getenv("ISSUE_TITLE")
 issue_body = os.getenv("ISSUE_BODY")
@@ -24,99 +22,66 @@ repo.git.config("user.email", "github-actions[bot]@users.noreply.github.com")
 repo.git.checkout(main_branch)
 repo.git.fetch("origin", main_branch)
 
-# ----------------- READ ALL SPLIT FILES -----------------
-files_content = {}
-for f in target_files:
-    with open(f, "r") as file:
-        files_content[f] = file.read()
+# ----------------- READ FULL main.py -----------------
+with open(main_file, "r") as f:
+    main_code = f.read()
 
-# ----------------- DETERMINE FILES THAT NEED CHANGES -----------------
-prompt_detect = f"""
+# ----------------- CREATE OPENAI PROMPT -----------------
+prompt = f"""
 Issue: {issue_title}
 Description: {issue_body}
 
-Below are all Python files in the project. 
-Please identify which files need updates to fix the issue. 
-Return a list of filenames only.
-Even if only a single line needs a change, include that file.
-Do NOT include explanations or code yet.
+Below is the current main.py code (full 600+ lines):
+
+{main_code}
+
+Instructions:
+- Return only the code that needs to be modified or added to fix the issue.
+- Include enough context so changes can be merged safely.
+- Use comments ### UPDATED START and ### UPDATED END around each modified block.
+- Do NOT return the entire main.py.
 """
 
-for filename, content in files_content.items():
-    prompt_detect += f"\n### FILE: {filename}\n{content}\n"
-
-# Call OpenAI to detect changed files
-response_detect = openai.chat.completions.create(
+# ----------------- CALL OPENAI -----------------
+response = openai.chat.completions.create(
     model="gpt-4",
-    messages=[{"role": "user", "content": prompt_detect}],
+    messages=[{"role": "user", "content": prompt}],
     temperature=0
 )
 
-changed_files_raw = response_detect.choices[0].message.content.strip().splitlines()
-changed_files = [f.strip() for f in changed_files_raw if f.strip() in target_files]
+modifications = response.choices[0].message.content.strip()
+if not modifications:
+    print("No changes detected by OpenAI. Exiting.")
+    exit(0)
 
-# ----------------- FALLBACK: use all files if none detected -----------------
-if not changed_files:
-    print("⚠️ No files detected by OpenAI, defaulting to all files.")
-    changed_files = target_files
+# Save the modifications separately for review
+with open(changes_file, "w") as f:
+    f.write(modifications)
 
-print(f"Files to be updated by OpenAI: {changed_files}")
+print(f"✅ Changes written to {changes_file}")
 
-# ----------------- CREATE PROMPT FOR UPDATING FILES -----------------
-prompt_update = f"""
-Issue: {issue_title}
-Description: {issue_body}
+# ----------------- MERGE MODIFICATIONS INTO main.py -----------------
+def merge_updates(original_code, updates):
+    """
+    Simple approach: append modified blocks at the end.
+    Can be enhanced to replace functions if needed.
+    """
+    merged_code = original_code + "\n\n# --- AUTO-UPDATE BLOCKS ---\n" + updates
+    return merged_code
 
-Please update ONLY the following Python files to resolve the issue. 
-Return the full updated content for each file.
-Keep file headers exactly as ### FILE: <filename>.
-Do NOT include markdown formatting.
-"""
+merged_code = merge_updates(main_code, modifications)
 
-for f in changed_files:
-    prompt_update += f"\n### FILE: {f}\n{files_content[f]}\n"
+with open(main_file, "w") as f:
+    f.write(merged_code)
 
-# Call OpenAI to get updated code
-response_update = openai.chat.completions.create(
-    model="gpt-4",
-    messages=[{"role": "user", "content": prompt_update}],
-    temperature=0
-)
-
-updated_text = response_update.choices[0].message.content.strip()
-
-# ----------------- PARSE UPDATED FILES -----------------
-updated_files = {}
-pattern = r"### FILE: ([^\n]+)\n([\s\S]*?)(?=(?:\n### FILE:|\Z))"
-matches = re.findall(pattern, updated_text)
-
-for filename, code in matches:
-    updated_files[filename.strip()] = code.strip()
-
-# Fallback: keep original content if OpenAI missed a file
-for f in changed_files:
-    if f not in updated_files:
-        updated_files[f] = files_content[f]
+print(f"✅ main.py updated with modifications")
 
 # ----------------- CREATE NEW BRANCH -----------------
 branch_name = f"issue-{uuid.uuid4().hex[:8]}"
-print(f"Creating new branch: {branch_name}")
 repo.git.checkout("-b", branch_name)
 
-# ----------------- WRITE UPDATED FILES -----------------
-for filename in target_files:
-    content_to_write = updated_files.get(filename, files_content[filename])
-    with open(filename, "w") as f:
-        f.write(content_to_write)
-
-# ----------------- MERGE ALL FILES INTO main.py -----------------
-with open(merged_file, "w") as f:
-    for fpart in target_files:
-        with open(fpart, "r") as part_file:
-            f.write(part_file.read() + "\n")
-
 # ----------------- COMMIT & PUSH -----------------
-repo.git.add(all=True)
+repo.git.add([main_file, changes_file])
 repo.git.commit("-m", f"Auto-update for issue: {issue_title}")
 repo.git.push("origin", branch_name)
 
@@ -130,7 +95,7 @@ pr_data = {
     "title": f"Fix: {issue_title}",
     "head": branch_name,
     "base": main_branch,
-    "body": f"Auto-generated update for issue:\n\n{issue_body}"
+    "body": f"Auto-generated update for issue:\n\n{issue_body}\n\nSee changes.py for modified code blocks."
 }
 
 r = requests.post(pr_url, headers=headers, json=pr_data)
