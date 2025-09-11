@@ -1,3 +1,4 @@
+```python
 # Assuming 'logs' is a list of log messages and 'log_display' is the component displaying the logs
 
 search_keyword = st.text_input("Search logs:")
@@ -18,3 +19,4 @@ for log in filtered_logs:
         st.markdown(f"<span style='color:green'>{log}</span>", unsafe_allow_html=True)
     else:
         st.markdown(log)
+```
