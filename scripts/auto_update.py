@@ -2,7 +2,6 @@ import os
 import openai
 from git import Repo
 import uuid
-import requests
 import re
 
 # ----------------- CONFIG -----------------
@@ -23,28 +22,39 @@ repo.git.config("user.name", "github-actions[bot]")
 repo.git.config("user.email", "github-actions[bot]@users.noreply.github.com")
 repo.git.checkout(main_branch)
 
-# ----------------- READ MAIN FILE -----------------
+# ----------------- READ main.py -----------------
 with open(main_file, "r") as f:
     main_code = f.read()
 
-# ----------------- CREATE OPENAI PROMPT -----------------
+# ----------------- INSERT PLACEHOLDERS (if missing) -----------------
+def ensure_placeholders(code):
+    if "### UPDATED START" not in code:
+        # Example: insert around the uploader
+        pattern = r"(uploaded_file\s*=\s*st\.file_uploader\(.*\))"
+        code = re.sub(pattern,
+                      "### UPDATED START\n# Placeholder for file uploader changes\n\\1\n### UPDATED END",
+                      code)
+    return code
+
+main_code = ensure_placeholders(main_code)
+
+# ----------------- EXTRACT SECTIONS TO UPDATE -----------------
+sections_to_update = re.findall(r"### UPDATED START(.*?)### UPDATED END", main_code, flags=re.S)
+if not sections_to_update:
+    print("No sections marked for updates found. Exiting.")
+    exit(0)
+
 prompt = f"""
 Issue: {issue_title}
 Description: {issue_body}
 
-You are given the following main.py code:
-
-{main_code}
-
-Instructions:
-- Only return the Python code parts that need to be changed or added.
-- Do NOT return the entire 600+ lines.
-- Do NOT include explanations or markdown.
-- Mark updated sections with:
-### UPDATED START
-<updated code here>
-### UPDATED END
+Only provide updates for the marked sections below.
+Return the updated code exactly in the same format with ### UPDATED START/END.
+Do NOT return full main.py, only updated sections.
 """
+
+for section in sections_to_update:
+    prompt += f"\n### SECTION ###\n{section.strip()}\n"
 
 # ----------------- CALL OPENAI -----------------
 response = openai.chat.completions.create(
@@ -53,29 +63,22 @@ response = openai.chat.completions.create(
     temperature=0
 )
 
-changes_text = response.choices[0].message.content.strip()
+updated_text = response.choices[0].message.content.strip()
 
-# Exit if no changes
-if not changes_text:
-    print("No changes detected. Exiting.")
-    exit(0)
-
-# ----------------- WRITE CHANGES -----------------
+# ----------------- WRITE changes.py -----------------
 with open(changes_file, "w") as f:
-    f.write(changes_text)
+    f.write(updated_text + "\n")
 
-# ----------------- MERGE CHANGES INTO MAIN -----------------
-updated_sections = re.findall(r"### UPDATED START(.*?)### UPDATED END", changes_text, flags=re.S)
-merged_code = main_code
-for section in updated_sections:
-    merged_code = re.sub(r"### UPDATED START.*?### UPDATED END", section.strip(), merged_code, flags=re.S)
-
-# Write updated main.py in new branch
+# ----------------- CREATE NEW BRANCH -----------------
 branch_name = f"issue-{uuid.uuid4().hex[:8]}"
 repo.git.checkout("-b", branch_name)
 
+# ----------------- MERGE UPDATES INTO main.py -----------------
+for updated_section in re.findall(r"### UPDATED START.*?### UPDATED END", updated_text, flags=re.S):
+    main_code = re.sub(r"### UPDATED START.*?### UPDATED END", updated_section.strip(), main_code, count=1, flags=re.S)
+
 with open(main_file, "w") as f:
-    f.write(merged_code)
+    f.write(main_code)
 
 # ----------------- COMMIT & PUSH -----------------
 repo.git.add(all=True)
@@ -83,6 +86,7 @@ repo.git.commit("-m", f"Auto-update for issue: {issue_title}")
 repo.git.push("origin", branch_name)
 
 # ----------------- CREATE PULL REQUEST -----------------
+import requests
 pr_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/pulls"
 headers = {
     "Authorization": f"token {GH_PAT}",
