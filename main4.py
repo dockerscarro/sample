@@ -67,21 +67,3 @@ def normalize_for_embedding(log):
     try:
         return log.split("] ", 1)[1] 
     except Exception:
-        return log
-
-def cluster_logs(logs, n_clusters=10):
-    if not logs:
-        return []
-
-    norm_texts = [normalize_for_embedding(l) for l in logs]
-    embeddings = embedder.encode(norm_texts, show_progress_bar=False)
-
-    k = min(n_clusters, len(logs))
-    kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-    labels = kmeans.fit_predict(embeddings)
-    clusters = defaultdict(list)
-    for label, log in zip(labels, logs):
-        clusters[label].append(log)
-    clustered_results = [sorted(group, key=extract_log_ts) for group in clusters.values()]
-
-    return clustered_results
