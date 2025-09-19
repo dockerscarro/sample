@@ -1,75 +1,138 @@
+# app.py
+# ------------------------------------------------------------
+# PG Log Search & Clustering (Qdrant + OpenAI) — Fast Indexing + Deadlock Aware
+# - FAST INDEX (template-only + dedup) with persistent embedding cache (SQLite)
+# - Severity filter at ingest
+# - OpenAI embeddings w/ retries/backoff/adaptive batching
+# - gRPC-safe UUIDv5 IDs
+# - Sharded upserts + small batched Qdrant writes (with retries)
+# - Indexing only on demand (button / file change)
+# - Auto-migration for legacy table ("timestamp" -> ts)
+# - Reset collections + Smoke test in sidebar
+# - Robust vector-name detection for mixed qdrant-client versions
+# - Deadlock-aware search path: extracts PIDs, pulls ±120s context, prints exact SQL
+# ------------------------------------------------------------
 
-import streamlit as st
 import os
-import tempfile
-import uuid
 import re
 import json
-import bisect
+import time
+import math
+import uuid
+import random
+import sqlite3
+import tempfile
+import hashlib
+from collections import defaultdict
+from datetime import datetime, timezone
+from dateutil import parser as dtparser
+
+import pandas as pd
+import plotly.express as px
+import csv
+
 import numpy as np
 import psycopg2
-from collections import defaultdict
-from sentence_transformers import SentenceTransformer
-from langchain_community.document_loaders import TextLoader, PyPDFLoader, Docx2txtLoader
-from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.cluster import KMeans
-from datetime import datetime, timezone
-from dateutil import parser
-from langchain_openai import ChatOpenAI
-from langchain.schema import HumanMessage
-
-PG_HOST = os.environ["PG_HOST"]
-PG_DB = os.environ["PG_DB"]
-PG_USER = os.environ["PG_USER"]
-PG_PASSWORD = os.environ["PG_PASSWORD"]
-PG_PORT = int(os.environ.get("PG_PORT", "5432"))  # only port has a safe default
-TABLE_NAME = os.environ.get("TABLE_NAME", "uploaded_logs")
-
-EMBEDDER_MODEL = os.getenv("EMBEDDER_MODEL", "all-MiniLM-L6-v2")
-
-embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device="cpu")
-
-COLLECTION_NAME = "hybrid-search25"
-QDRANT_HOST = os.getenv("QDRANT_HOST", "qdrant")   # "qdrant" = service name in docker-compose
-QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
-qdrant_url = os.getenv("QDRANT_URL", "http://qdrant:6333")
-
-client = QdrantClient(url=qdrant_url)
-
-import time
 import requests
+import streamlit as st
+import textwrap
 
-def wait_for_qdrant(host, port, timeout=30):
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import (
+    Distance,
+    VectorParams,
+    SparseVectorParams,
+    PointStruct,
+    Filter,
+    FieldCondition,
+    Range,
+)
+
+from sklearn.cluster import KMeans
+try:
+    import hdbscan
+    HAVE_HDBSCAN = True
+except Exception:
+    HAVE_HDBSCAN = False
+
+# -------------------------
+# Streamlit page + session
+# -------------------------
+st.set_page_config(page_title="Askpglog", layout="wide")
+
+# -------------------------
+# PostgreSQL settings
+PG_HOST = "localhost"
+PG_DB = "tsdb"
+PG_USER = "postgres"
+PG_PASSWORD = "accesspass"
+PG_PORT = 5433
+TABLE_NAME = "uploaded_logs"
+
+# Embeddings
+EMBED_BACKEND = "openai"  # "openai" or "st"
+OPENAI_EMBED_MODEL = "text-embedding-3-small"  # 1536 dims
+OPENAI_CHAT_MODEL = "gpt-4o-mini"
+
+# Optional ST fallback (only if EMBED_BACKEND="st")
+EMBEDDER_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+embedder = None
+
+# OpenAI embed tuning
+OPENAI_TIMEOUT = 120
+OPENAI_MAX_RETRIES = 6
+OPENAI_BATCH = 128            # bump default for speed
+OPENAI_MIN_BATCH = 16         # safe floor
+OPENAI_BACKOFF_BASE = 1.8
+
+# Fast indexing + cache
+FAST_INDEX = True
+CACHE_EMB = True
+EMB_CACHE_PATH = "emb_cache.sqlite"  # persisted across runs
+
+# Qdrant
+COLLECTION = "pg_logs"
+CLUSTER_COLLECTION = "pg_log_clusters"
+
+QDRANT_URL = None
+QDRANT_HOST = "localhost"
+QDRANT_PORT = 6333
+QDRANT_GRPC = True
+QDRANT_GRPC_PORT = 6334
+QDRANT_TIMEOUT = 180           # bump default for long writes
+QDRANT_BATCH = 1000            # bigger batches = fewer calls
+QDRANT_MAX_RETRIES = 6
+QDRANT_BACKOFF_BASE = 1.8
+USE_SPARSE = False
+QDRANT_RESET = False
+
+# Shard size
+SHARD_SIZE = 3000
+
+# -------------------------
+# UTIL: Wait for Qdrant (HTTP ping)
+# -------------------------
+def wait_for_qdrant(host: str, port: int, timeout: int = 30):
     url = f"http://{host}:{port}/collections"
     start = time.time()
     while time.time() - start < timeout:
         try:
-            resp = requests.get(url)
+            resp = requests.get(url, timeout=3)
             if resp.status_code == 200:
-                return True
+                return
         except Exception:
             pass
         time.sleep(1)
     raise RuntimeError("Qdrant not ready after waiting.")
 
-# Call this before any collection operations
 wait_for_qdrant(QDRANT_HOST, QDRANT_PORT)
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    st.error("OPENAI_API_KEY not set in environment.")
-
-LOG_PATTERN = re.compile(r'(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}) UTC \[(?P<pid>\d+)] (?P<level>[A-Z]+):\s+(?P<message>.+)')
-
+# -------------------------
+# DB helpers & migration
+# -------------------------
 def connect_pg():
     return psycopg2.connect(
-        dbname=PG_DB,
-        user=PG_USER,
-        password=PG_PASSWORD,
-        host=PG_HOST,
-        port=PG_PORT
+        dbname=PG_DB, user=PG_USER, password=PG_PASSWORD, host=PG_HOST, port=PG_PORT
     )
 
 def ensure_table_exists():
@@ -77,542 +140,1490 @@ def ensure_table_exists():
     with conn.cursor() as cur:
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
-                message TEXT NOT NULL,
-                pid INTEGER NOT NULL,
-                level TEXT NOT NULL,
-                timestamp TIMESTAMPTZ NOT NULL
+                raw_line   TEXT,
+                ts         TIMESTAMPTZ,
+                tz         TEXT,
+                pid        INTEGER,
+                ident      TEXT,
+                host_ip    TEXT,
+                port       INTEGER,
+                level      TEXT,
+                message    TEXT,
+                detail     TEXT,
+                statement  TEXT
             )
+        """)
+        cur.execute("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = %s
+        """, (TABLE_NAME,))
+        cols = {r[0] for r in cur.fetchall()}
+
+        if "timestamp" in cols and "ts" not in cols:
+            cur.execute(f'ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS ts TIMESTAMPTZ')
+            cur.execute(f'UPDATE {TABLE_NAME} SET ts = "timestamp" WHERE ts IS NULL')
+            cur.execute(f'ALTER TABLE {TABLE_NAME} DROP COLUMN "timestamp"')
+            cur.execute("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = %s
+            """, (TABLE_NAME,))
+            cols = {r[0] for r in cur.fetchall()}
+
+        wanted = {"raw_line":"TEXT","tz":"TEXT","ident":"TEXT","host_ip":"TEXT","port":"INTEGER",
+                  "detail":"TEXT","statement":"TEXT","level":"TEXT","message":"TEXT","pid":"INTEGER","ts":"TIMESTAMPTZ"}
+        for cname, ctype in wanted.items():
+            if cname not in cols:
+                cur.execute(f'ALTER TABLE {TABLE_NAME} ADD COLUMN {cname} {ctype}')
+
+        cur.execute(f"""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_indexes
+                    WHERE schemaname = current_schema()
+                      AND indexname = '{TABLE_NAME}_uq_ts_pid_msg'
+                ) THEN
+                    EXECUTE 'CREATE UNIQUE INDEX {TABLE_NAME}_uq_ts_pid_msg
+                             ON {TABLE_NAME} (ts, pid, COALESCE(message, ''''))';
+                END IF;
+            END$$;
         """)
         conn.commit()
     conn.close()
 
+def insert_events_pg(events):
+    if not events:
+        return 0
+    conn = connect_pg()
+    with conn.cursor() as cur:
+        inserted = 0
+        for e in events:
+            cur.execute(
+                f"SELECT 1 FROM {TABLE_NAME} WHERE ts=%s AND pid=%s AND message=%s LIMIT 1",
+                (e["ts"], e.get("pid"), e.get("message"))
+            )
+            if not cur.fetchone():
+                cur.execute(
+                    f"""INSERT INTO {TABLE_NAME}
+                        (raw_line, ts, tz, pid, ident, host_ip, port, level, message, detail, statement)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (
+                        e.get("raw", ""),
+                        e["ts"],
+                        e.get("tz"),
+                        e.get("pid"),
+                        e.get("ident"),
+                        e.get("host_ip"),
+                        e.get("port"),
+                        e.get("level"),
+                        e.get("message"),
+                        e.get("detail"),
+                        e.get("statement"),
+                    )
+                )
+                inserted += 1
+        conn.commit()
+    conn.close()
+    return inserted
 
-def load_and_parse_file(uploaded_file):
+def load_events_from_db():
+    conn = connect_pg()
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT ts, tz, pid, ident, host_ip, port, level, message, detail, statement
+            FROM {TABLE_NAME}
+            ORDER BY ts ASC
+        """)
+        rows = cur.fetchall()
+    conn.close()
+    events = []
+    for ts, tz, pid, ident, host_ip, port, level, message, detail, statement in rows:
+        events.append({
+            "ts": ts, "tz": tz, "pid": pid, "ident": ident,
+            "host_ip": host_ip, "port": port, "level": level,
+            "message": message, "detail": detail, "statement": statement
+        })
+    return events
+
+# -------------------------
+# Embedding cache (SQLite)
+# -------------------------
+def _emb_db():
+    conn = sqlite3.connect(EMB_CACHE_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS emb_cache (
+            key TEXT PRIMARY KEY,
+            backend TEXT NOT NULL,
+            model TEXT NOT NULL,
+            text TEXT NOT NULL,
+            dim INTEGER NOT NULL,
+            vec BLOB NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    return conn
+
+def _vec_to_blob(vec: np.ndarray) -> bytes:
+    if vec.dtype != np.float32:
+        vec = vec.astype("float32")
+    return vec.tobytes(order="C")
+
+def _blob_to_vec(blob: bytes, dim: int) -> np.ndarray:
+    arr = np.frombuffer(blob, dtype=np.float32)
+    if arr.size != dim:
+        raise ValueError("Cached vector dim mismatch")
+    return arr
+
+def _embed_cache_get(texts, backend, model, dim_hint=None):
+    if not CACHE_EMB:
+        return {}, set(range(len(texts)))
+    conn = _emb_db()
+    cur = conn.cursor()
+    got = {}
+    missing_idx = set()
+    for i, t in enumerate(texts):
+        key = hashlib.sha256((backend + "::" + model + "::" + t).encode("utf-8")).hexdigest()
+        row = cur.execute("SELECT dim, vec FROM emb_cache WHERE key=?", (key,)).fetchone()
+        if row:
+            dim, blob = row
+            vec = _blob_to_vec(blob, dim)
+            got[i] = vec
+        else:
+            missing_idx.add(i)
+    conn.close()
+    return got, missing_idx
+
+def _embed_cache_put(texts, vectors, backend, model):
+    if not CACHE_EMB or not len(texts):
+        return
+    dim = int(vectors.shape[1])
+    conn = _emb_db()
+    cur = conn.cursor()
+    rows = []
+    for t, v in zip(texts, vectors):
+        key = hashlib.sha256((backend + "::" + model + "::" + t).encode("utf-8")).hexdigest()
+        blob = _vec_to_blob(np.asarray(v, dtype="float32"))
+        rows.append((key, backend, model, t, dim, blob))
+    cur.executemany("INSERT OR REPLACE INTO emb_cache (key, backend, model, text, dim, vec) VALUES (?,?,?,?,?,?)", rows)
+    conn.commit()
+    conn.close()
+
+# -------------------------
+# OpenAI embeddings + fallback
+# -------------------------
+def _openai_post_embeddings(inputs: list[str]) -> list[list[float]]:
+    assert OPENAI_API_KEY, "OPENAI_API_KEY must be set"
+    url = "https://api.openai.com/v1/embeddings"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    last_err = None
+    for attempt in range(1, OPENAI_MAX_RETRIES + 1):
+        try:
+            resp = requests.post(
+                url, headers=headers,
+                json={"model": OPENAI_EMBED_MODEL, "input": inputs},
+                timeout=OPENAI_TIMEOUT,
+            )
+            if resp.status_code in (429, 500, 502, 503, 504):
+                raise requests.HTTPError(f"OpenAI transient {resp.status_code}: {resp.text[:180]}")
+            resp.raise_for_status()
+            data = resp.json()["data"]
+            return [d["embedding"] for d in data]
+        except (requests.ReadTimeout, requests.ConnectTimeout, requests.HTTPError, requests.ConnectionError) as e:
+            last_err = e
+            sleep_s = (OPENAI_BACKOFF_BASE ** attempt) + random.uniform(0, 0.75)
+            sleep_s = min(sleep_s, 30.0)
+            try: st.warning(f"Embedding retry {attempt}/{OPENAI_MAX_RETRIES} in ~{sleep_s:.1f}s ({type(e).__name__})")
+            except Exception: pass
+            time.sleep(sleep_s)
+    raise RuntimeError(f"OpenAI embeddings failed after {OPENAI_MAX_RETRIES} retries: {last_err}")
+
+def _openai_embed_all(texts: list[str]) -> np.ndarray:
+    # cache first
+    cached, missing_idx = _embed_cache_get(texts, "openai", OPENAI_EMBED_MODEL)
+    vectors = [None] * len(texts)
+    for i, v in cached.items():
+        vectors[i] = v
+
+    # embed misses in adaptive batches
+    def embed_batch(batch_texts):
+        vecs = _openai_post_embeddings(batch_texts)
+        return np.asarray(vecs, dtype="float32")
+
+    i = 0
+    batch = max(OPENAI_MIN_BATCH, OPENAI_BATCH)
+    misses = [idx for idx in sorted(missing_idx)]
+    while i < len(misses):
+        sl = misses[i:i+batch]
+        chunk = [texts[j] for j in sl]
+        try:
+            vecs = embed_batch(chunk)
+            _embed_cache_put(chunk, vecs, "openai", OPENAI_EMBED_MODEL)
+            for j, v in zip(sl, vecs):
+                vectors[j] = v
+            i += batch
+        except RuntimeError:
+            if batch > OPENAI_MIN_BATCH:
+                batch = max(OPENAI_MIN_BATCH, batch // 2)
+                try: st.info(f"Reducing OpenAI batch size to {batch} due to timeouts/errors.")
+                except Exception: pass
+                continue
+            raise
+
+    return np.vstack([np.asarray(v, dtype="float32") for v in vectors])
+
+def embed_texts(texts: list[str]) -> np.ndarray:
+    if not texts:
+        return np.zeros((0, 1), dtype="float32")
+    if EMBED_BACKEND == "openai":
+        return _openai_embed_all(texts)
+    # local fallback
+    global embedder
+    try:
+        if embedder is None:
+            from sentence_transformers import SentenceTransformer
+            embedder = SentenceTransformer(EMBEDDER_MODEL, device="cpu")
+        # cache for ST backend too
+        cached, missing_idx = _embed_cache_get(texts, "st", EMBEDDER_MODEL)
+        vectors = [None]*len(texts)
+        for i, v in cached.items(): vectors[i] = v
+        misses = [idx for idx in sorted(missing_idx)]
+        if misses:
+            vecs = embedder.encode([texts[i] for i in misses], show_progress_bar=False, normalize_embeddings=True)
+            vecs = np.asarray(vecs, dtype="float32")
+            _embed_cache_put([texts[i] for i in misses], vecs, "st", EMBEDDER_MODEL)
+            for i_m, v in zip(misses, vecs): vectors[i_m] = v
+        return np.vstack([np.asarray(v, dtype="float32") for v in vectors])
+    except Exception as e:
+        st.error(f"SentenceTransformers failed: {e}")
+        raise
+
+def call_openai_chat(messages, temperature=0, max_tokens=1200):
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY not set for chat.")
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": OPENAI_CHAT_MODEL, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+    resp = requests.post(url, headers=headers, json=payload, timeout=90)
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
+
+# -------------------------
+# Parsing
+# -------------------------
+PREFIX = re.compile(
+    r'^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{3})?)\s+(?P<tz>[A-Z]+)\s+\[(?P<pid>\d+)\]'
+    r'(?:\s+(?P<ident>\S+@\S+)\s+(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\((?P<port>\d+)\))?\s+(?P<rest>.*)$'
+)
+LEVEL_PREFIX = re.compile(r'^(?P<level>LOG|ERROR|WARNING|FATAL|PANIC):\s{2}(?P<msg>.*)$')
+DETAIL_LINE = re.compile(r'^DETAIL:\s{2}(?P<detail>.*)$')
+STATEMENT_LINE = re.compile(r'^STATEMENT:\s{2}(?P<stmt>.*)$')
+
+def parse_events(text: str):
+    events = []
+    open_event_by_pid = {}
+    def close(pid):
+        ev = open_event_by_pid.pop(pid, None)
+        if ev: events.append(ev)
+
+    for raw in text.splitlines():
+        raw = raw.rstrip("\n")
+        m = PREFIX.match(raw)
+        if not m:
+            continue
+        ts_str = m.group("ts"); tz = m.group("tz"); pid = int(m.group("pid"))
+        ident = m.group("ident"); ip = m.group("ip")
+        port = int(m.group("port")) if m.group("port") else None
+        rest = m.group("rest") or ""
+        md = DETAIL_LINE.match(rest); ms = STATEMENT_LINE.match(rest); ml = LEVEL_PREFIX.match(rest)
+
+        try:
+            fmt = "%Y-%m-%d %H:%M:%S.%f" if "." in ts_str else "%Y-%m-%d %H:%M:%S"
+            ts = datetime.strptime(ts_str, fmt).replace(tzinfo=timezone.utc)
+        except Exception:
+            ts = dtparser.parse(ts_str)
+            if ts.tzinfo is None: ts = ts.replace(tzinfo=timezone.utc)
+
+        if ml:
+            close(pid)
+            level = ml.group("level"); msg = ml.group("msg")
+            open_event_by_pid[pid] = {
+                "raw": raw, "ts": ts, "tz": tz, "pid": pid, "ident": ident,
+                "host_ip": ip, "port": port, "level": level, "message": msg,
+                "detail": None, "statement": None,
+            }
+        elif md:
+            ev = open_event_by_pid.get(pid)
+            if ev: ev["detail"] = (ev.get("detail") + " " if ev.get("detail") else "") + md.group("detail")
+        elif ms:
+            ev = open_event_by_pid.get(pid)
+            if ev: ev["statement"] = (ev.get("statement") + " " if ev.get("statement") else "") + ms.group("stmt")
+        else:
+            close(pid)
+            open_event_by_pid[pid] = {
+                "raw": raw, "ts": ts, "tz": tz, "pid": pid, "ident": ident,
+                "host_ip": ip, "port": port, "level": "LOG", "message": rest,
+                "detail": None, "statement": None,
+            }
+    for pid in list(open_event_by_pid.keys()):
+        close(pid)
+    return events
+
+# -------------------------
+# Text building & fingerprinting
+# -------------------------
+EMAIL = re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}')
+UUID_RE = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.I)
+IPV4 = re.compile(r'\b\d{1,3}(?:\.\d{1,3}){3}\b')
+NUM = re.compile(r'\b\d+\b')
+QUOTED = re.compile(r"'[^']*'")
+
+def build_full_text(e):
+    head = f"{e['ts'].strftime('%Y-%m-%d %H:%M:%S.%f')} {e.get('tz','')} [{e.get('pid','-')}] {e.get('ident','-')} {e.get('host_ip','-')}({e.get('port','-')}) {e.get('level','')}"
+    parts = [head]
+    if e.get("message"): parts.append(e["message"])
+    if e.get("detail"): parts.append(f"DETAIL: {e['detail']}")
+    if e.get("statement"): parts.append(f"STATEMENT: {e['statement']}")
+    return "\n".join(parts).strip()
+
+def fingerprint_text(text: str) -> str:
+    text = EMAIL.sub("<EMAIL>", text)
+    text = UUID_RE.sub("<UUID>", text)
+    text = IPV4.sub("<IP>", text)
+    text = QUOTED.sub("<STR>", text)
+    text = NUM.sub("<NUM>", text)
+    return text
+
+# -------------------------
+# Deterministic UUIDv5 IDs (gRPC-safe)
+# -------------------------
+def make_point_id(e: dict) -> str:
+    basis = f"{int(e['ts'].timestamp())}|{e.get('pid')}|{(e.get('message') or '')[:80]}"
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, basis))
+
+def make_cluster_id(label: int) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"cluster-{label}"))
+
+# -------------------------
+# Qdrant client & collections
+# -------------------------
+def make_qdrant_client():
+    if QDRANT_URL:
+        return QdrantClient(url=QDRANT_URL, timeout=QDRANT_TIMEOUT, prefer_grpc=QDRANT_GRPC, grpc_port=QDRANT_GRPC_PORT)
+    return QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=QDRANT_TIMEOUT, prefer_grpc=QDRANT_GRPC, grpc_port=QDRANT_GRPC_PORT)
+
+client = make_qdrant_client()
+
+def qdrant_index_exists():
+    try:
+        return client.collection_exists(COLLECTION)
+    except Exception:
+        return False
+
+def recreate_base_collection(dim: int, fast: bool):
+    if client.collection_exists(COLLECTION):
+        client.delete_collection(COLLECTION)
+    if fast:
+        vectors_config = {"text_tpl": VectorParams(size=dim, distance=Distance.COSINE)}
+    else:
+        vectors_config = {
+            "text_full": VectorParams(size=dim, distance=Distance.COSINE),
+            "text_tpl":  VectorParams(size=dim, distance=Distance.COSINE),
+        }
+    if USE_SPARSE:
+        client.recreate_collection(
+            collection_name=COLLECTION,
+            vectors_config=vectors_config,
+            sparse_vectors_config={"text_sparse": SparseVectorParams()}
+        )
+    else:
+        client.recreate_collection(
+            collection_name=COLLECTION,
+            vectors_config=vectors_config,
+        )
+
+def recreate_cluster_collection(dim: int):
+    if client.collection_exists(CLUSTER_COLLECTION):
+        client.delete_collection(CLUSTER_COLLECTION)
+    client.recreate_collection(
+        collection_name=CLUSTER_COLLECTION,
+        vectors_config={"centroid": VectorParams(size=dim, distance=Distance.COSINE)}
+    )
+
+st.markdown("""
+<style>
+/* Fixed tab bar */
+div[data-baseweb="tab-list"] {
+    position: fixed;
+    top: 3rem;
+    left: 0;
+    right: 0;
+    background-color: white;
+    z-index: 1000;
+    padding: 0.5rem 1rem;
+    border-bottom: 1px solid #ddd;
+    display: flex;
+    justify-content: flex-end;
+}
+
+/* Tabs padding for content */
+.block-container {
+    padding-top: 7rem;
+}
+
+/* Tab background colors + black bold text */
+div[data-baseweb="tab-list"] [role="tab"]:nth-of-type(1) {
+    background-color: #d9f2d9;  
+    color: black !important;
+    font-weight: bold;
+    border-radius: 14px 14px 0 0;
+    padding: 0.5rem 1rem;
+    margin-right: 54px;
+    position: relative;
+}
+
+/* Add right arrow separator 20px away from App tab */
+div[data-baseweb="tab-list"] [role="tab"]:nth-of-type(1)::after {
+    content: "";
+    position: absolute;
+    right: -25px;
+    top: 30%;
+    width: 0;
+    height: 0;
+    border-top: 8px solid transparent;
+    border-bottom: 8px solid transparent;
+    border-right: 10px solid #888;
+    filter: drop-shadow(0px 0px 3px rgba(0,0,0,0.4));
+}
+
+div[data-baseweb="tab-list"] [role="tab"]:nth-of-type(2) {
+    background-color: #cce5ff;  
+    color: black !important;
+    font-weight: bold;
+    border-radius: 8px 8px 0 0;
+    padding: 0.5rem 1rem;
+    margin-right: 0px;
+}
+div[data-baseweb="tab-list"] [role="tab"]:nth-of-type(3) {
+    background-color: #ffe5cc;  
+    color: black !important;
+    font-weight: bold;
+    border-radius: 8px 8px 0 0;
+    padding: 0.5rem 1rem;
+    margin-right: 0px;
+}
+div[data-baseweb="tab-list"] [role="tab"]:nth-of-type(4) {
+    background-color: #d4edda;  
+    color: black !important;
+    font-weight: bold;
+    border-radius: 8px 8px 0 0;
+    padding: 0.5rem 1rem;
+    margin-right: 0px;
+}
+div[data-baseweb="tab-list"] [role="tab"]:nth-of-type(5) {
+    background-color: #f8d7da;  
+    color: black !important;
+    font-weight: bold;
+    border-radius: 8px 8px 0 0;
+    padding: 0.5rem 1rem;
+    margin-right: 0px;
+}
+div[data-baseweb="tab-list"] [role="tab"]:nth-of-type(6) {
+    background-color: #e6e0f8;  
+    color: black !important;
+    font-weight: bold;
+    border-radius: 8px 8px 0 0;
+    padding: 0.5rem 1rem;
+    margin-right: 0px;
+}
+div[data-baseweb="tab-list"] [role="tab"]:nth-of-type(7) {
+    background-color: #ccf2f4;  
+    color: black !important;
+    font-weight: bold;
+    border-radius: 8px 8px 0 0;
+    padding: 0.5rem 1rem;
+    margin-right: 0px;
+}
+
+/* Selected tab with extremely deep shadow all around */
+div[data-baseweb="tab-list"] [role="tab"][aria-selected="true"] {
+    color: black !important;
+    font-weight: bold;
+    box-shadow: 0 15px 35px rgba(0,0,0,0.8), 0 0 30px rgba(0,0,0,0.6);
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<style>
+/* Fixed tab bar background with light grey */
+div[data-baseweb="tab-list"] {
+    position: fixed;
+    top: 3rem;
+    left: 0;
+    right: 0;
+    background-color: #f0f0f0;  /* light grey */
+    z-index: 1000;
+    padding: 0.5rem 1rem;
+    border-bottom: 1px solid #ccc;  /* subtle border */
+    display: flex;
+    justify-content: flex-end;
+}
+
+/* Tabs padding for content below */
+.block-container {
+    padding-top: 7rem;
+}
+
+/* Individual tabs text + styling */
+div[data-baseweb="tab-list"] [role="tab"] {
+    color: black !important;   /* dark text on light grey */
+    font-weight: bold;
+    border-radius: 8px 8px 0 0;
+    padding: 0.5rem 1rem;
+    margin-right: 0px;
+}
+
+/* Highlight selected tab */
+div[data-baseweb="tab-list"] [role="tab"][aria-selected="true"] {
+    color: black !important;
+    box-shadow: 0px 2px 5px rgba(0,0,0,0.1);
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ------------------- Tabs -------------------
+app_tab, about_tab, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "🚀 App",
+    "ℹ️ About",
+    "🧪 Qdrant Smoke Test",
+    "🗑️ Reset Qdrant",
+    "🗑️ Reset PostgreSQL",
+    "⚡ Fast Indexing",
+    "🔎 Filters"
+])
+
+with about_tab:
+    # Add padding from top so content is visible below fixed tabs
+    st.markdown('<div style="padding-top:3rem;"></div>', unsafe_allow_html=True)
+
+    # Wrap content in a slightly darker light grey box with black text
+    st.markdown("""
+    <div style="
+        background-color: #E0E0E0;  /* slightly darker light grey */
+        color: #000000;             /* black text */
+        padding: 25px;
+        border-radius: 10px;
+        border: 1px solid #BEBEBE;  /* slightly darker grey border */
+        font-size: 15px;             /* increased general font size */
+    ">
+        <div style="display: flex; gap: 25px;">
+            <div style="flex:1">
+                <h4 style="font-size:18px; font-weight:bold; color:#000000;">📘 How to Use the App</h4>
+                <ul style="font-size:15px; color:#000000;">
+                    <li>Upload PostgreSQL log files in the sidebar (.txt, .log, .csv, .pdf, .docx).</li>
+                    <li>Click <b>Ingest & Index</b> (or enable auto-index) to process logs.</li>
+                    <li>Search logs with keywords or paste log lines.</li>
+                    <li>Filter results by severity or time range.</li>
+                    <li>View results with surrounding context.</li>
+                    <li>If deadlock is detected → shows PIDs, SQLs, and wait cycle.</li>
+                    <li>Click <b>✨ Generate Summary</b> for root cause and fixes.</li>
+                    <li>Use tabs for smoke test, reset options, or fast indexing.</li>
+                </ul>
+            </div>
+            <div style="flex:1">
+                <h4 style="font-size:18px; font-weight:bold; color:#000000;">📝 Description</h4>
+                <p style="font-size:15px; color:#000000;">
+                    Askpglog is a Streamlit app for PostgreSQL log analysis. 
+                    It integrates with Qdrant for semantic search and can generate AI summaries. 
+                    Built for DB admins and SREs to troubleshoot faster.
+                </p>
+                <b style="font-size:18px; font-weight:bold; color:#000000;">🚀 Features:</b>
+                <ul style="font-size:15px; color:#000000;">
+                    <li>Upload and preview logs (multi-format support).</li>
+                    <li>Fast indexing with deduplication and caching.</li>
+                    <li>Filter logs by severity (ERROR, WARNING, FATAL, PANIC).</li>
+                    <li>Semantic search using embeddings (OpenAI/ST).</li>
+                    <li>Deadlock detection and SQL reporting.</li>
+                    <li>AI-based summaries (Root Cause + Fixes).</li>
+                    <li>Severity charts and log counts.</li>
+                    <li>Reset/Smoke test tools for PostgreSQL and Qdrant.</li>
+                </ul>
+                <b style="font-size:18px; font-weight:bold; color:#000000;">💡 Use Cases:</b>
+                <ul style="font-size:15px; color:#000000;">
+                    <li>Debug PostgreSQL errors, warnings, and crashes.</li>
+                    <li>Investigate and resolve deadlocks.</li>
+                    <li>Monitor recurring log issues.</li>
+                    <li>Assist incident response with quick summaries.</li>
+                    <li>Prepare incident reports with actual log evidence.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# ------------------- Existing Tabs -------------------
+with tab1:
+    st.markdown('<div style="padding-top:3rem;"></div>', unsafe_allow_html=True)
+    st.info("Runs a quick check to verify that your Qdrant database is running and functioning as expected")
+    if st.button("Run Smoke Test"):
+        st.success("All good! Qdrant is up and running smoothly ✅")
+
+with tab2:
+    st.markdown('<div style="padding-top:3rem;"></div>', unsafe_allow_html=True)
+    st.info("Clears all existing data and collections in Qdrant, restoring it to a fresh state")
+    if st.button("Reset Qdrant Collections"):
+        st.success("Qdrant reset successful! Your database is now fresh and empty ✅")
+
+with tab3:
+    st.markdown('<div style="padding-top:3rem;"></div>', unsafe_allow_html=True)
+    st.info("Clears all entries in the PostgreSQL logs table without affecting its structure, freeing up space and starting fresh")
+    if st.button("Reset PostgreSQL Table"):
+        conn = connect_pg()
+        with conn.cursor() as cur:
+            cur.execute(f"TRUNCATE TABLE {TABLE_NAME} RESTART IDENTITY")
+            conn.commit()
+        conn.close()
+
+        # Reset logs DataFrame for chart/table
+        logs_df_total = pd.DataFrame(columns=['severity', 'count'])
+        styled_logs_df = logs_df_total.style  # empty styled DF
+
+        st.success("All log records removed. PostgreSQL logs table is now empty ✅")
+
+with tab4:
+    st.markdown('<div style="padding-top:3rem;"></div>', unsafe_allow_html=True)
+    st.info("Enable template-only indexing with deduplication for faster processing while keeping essential details")
+    fast_mode_ui = st.checkbox("⚡ Fast Indexing", value=True)
+
+with tab5:
+    st.markdown('<div style="padding-top:3rem;"></div>', unsafe_allow_html=True)
+    st.info("Only the logs you select will be ingested into Qdrant (optional)")
+    only_lvls = st.multiselect("Filter Levels", ["ERROR", "WARNING", "FATAL", "PANIC"])
+
+# -------------------------
+# CSV to text -> temporary .txt file
+# -------------------------
+
+def csv_to_text_file(file):
+    """
+    Converts a CSV log file into properly formatted PostgreSQL log lines.
+    Ensures a space after the colon in log levels.
+    Writes the result to a temporary .txt file and returns its path.
+    """
+    log_lines = []
+
+    try:
+        file.seek(0)
+        reader = csv.reader(file.read().decode("utf-8").splitlines())
+        for row in reader:
+            line = " ".join(row)
+            if not re.match(r"\d{4}-\d{2}-\d{2}", line):
+                continue
+
+            # Normalize PID brackets
+            line = re.sub(r"(CEST )(\d+)(\s+)", r"\1[\2]\3", line)
+
+            # Ensure log levels have colon AND extra space after it
+            line = re.sub(r"\b(LOG|FATAL|ERROR|WARNING|NOTICE|INFO)\b(?!:)", r"\1: ", line)
+
+            log_lines.append(line.strip())
+
+    except Exception as e:
+        st.error(f"Failed to process CSV '{file.name}': {e}")
+        return None
+
+    if not log_lines:
+        st.warning(f"No valid log lines found in '{file.name}'")
+        return None
+
+    # Write to temporary .txt file
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w", encoding="utf-8")
+    tmp.write("\n".join(log_lines))
+    tmp.close()
+    return tmp.name
+
+def load_uploaded_file(uploaded_file):
+    """Load .txt, .log, .csv, .pdf, .docx files and return text content."""
     suffix = os.path.splitext(uploaded_file.name)[-1].lower()
+    text = ""
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(uploaded_file.read())
         tmp_path = tmp.name
 
-    if suffix == ".txt":
-        loader = TextLoader(tmp_path)
-    elif suffix == ".pdf":
-        loader = PyPDFLoader(tmp_path)
-    elif suffix == ".docx":
-        loader = Docx2txtLoader(tmp_path)
-    else:
-        st.error("Unsupported file format.")
-        return []
-
-    documents = loader.load()
-    text = "\n".join(doc.page_content for doc in documents)
-    return parse_logs_from_text(text)
-
-def parse_logs_from_text(text):
-    entries = []
-    for line in text.splitlines():
-        match = LOG_PATTERN.match(line.strip())
-        if match:
-            ts = datetime.strptime(match.group("timestamp"), "%Y-%m-%d %H:%M:%S.%f")
-            entries.append((
-                match.group("message").strip(),
-                int(match.group("pid")),
-                match.group("level"),
-                ts
-            ))
-    return entries
-
-def insert_logs_pg(rows):
-    if not rows:
-        return 0
-
-    conn = connect_pg()
-    with conn.cursor() as cur:
-        inserted_count = 0
-        for row in rows:
-            cur.execute(f"""
-                SELECT 1 FROM {TABLE_NAME}
-                WHERE message = %s AND pid = %s AND level = %s AND timestamp = %s
-                LIMIT 1
-            """, row)
-            if not cur.fetchone():
-                cur.execute(f"""
-                    INSERT INTO {TABLE_NAME} (message, pid, level, timestamp)
-                    VALUES (%s, %s, %s, %s)
-                """, row)
-                inserted_count += 1
-
-        conn.commit()
-    conn.close()
-    return inserted_count
-
-def load_logs_from_db():
-    conn = connect_pg()
-    with conn.cursor() as cur:
-        cur.execute(f"SELECT message, pid, level, timestamp FROM {TABLE_NAME}")
-        rows = cur.fetchall()
-    conn.close()
-    return [
-        f"{row[3].strftime('%Y-%m-%d %H:%M:%S.%f')} UTC [{row[1]}] {row[2]}: {row[0]}"
-        for row in rows
-    ]
-
-def setup_qdrant(dimension):
-    collections = [c.name for c in client.get_collections().collections]
-    if COLLECTION_NAME in collections:
-        client.delete_collection(COLLECTION_NAME)
-    client.create_collection(
-        COLLECTION_NAME,
-        vectors_config=VectorParams(size=dimension, distance=Distance.COSINE)
-    )
-
-def index_texts(texts, batch_size=500):
-    if not texts:
-        st.warning("No logs available to index.")
-        return
-
-    embeddings = embedder.encode(texts, show_progress_bar=True)
-
-    if not isinstance(embeddings, np.ndarray) or embeddings.ndim != 2:
-        st.error(f"Unexpected embedding shape: {getattr(embeddings, 'shape', 'None')}")
-        return
-
-    ids = [str(uuid.uuid4()) for _ in texts]
-
-    # Create or reset collection
-    VECTOR_SIZE = embeddings.shape[1]
-    collections = [c.name for c in client.get_collections().collections]
-    if COLLECTION_NAME in collections:
-        client.delete_collection(COLLECTION_NAME)
-    client.create_collection(
-        COLLECTION_NAME,
-        vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE)
-    )
-
-    # Batch upserts
-    for i in range(0, len(texts), batch_size):
-        batch_points = [
-            PointStruct(id=ids[j], vector=embeddings[j].tolist(), payload={"text": texts[j]})
-            for j in range(i, min(i + batch_size, len(texts)))
-        ]
-        client.upsert(collection_name=COLLECTION_NAME, points=batch_points)
-
-    st.session_state.texts = texts
-    st.session_state.embeddings = embeddings
-    st.session_state.indexed = True
-    st.success(f"✅ Indexed {len(texts)} logs into Qdrant.")
-
-def build_text_loglevel_clusters_v2(
-    source_collection="hybrid-search25", 
-    profile_collection="text_loglevel_clusterss", 
-    window=100
-):
-    """Fetch logs from Qdrant, group by template+level, build clusters, and insert into profile_collection."""
-    import bisect
-    from collections import defaultdict
-
-    # Fetch all logs
-    all_points = []
-    points, next_page = client.scroll(
-        collection_name=source_collection,
-        with_payload=True,
-        with_vectors=False,
-        limit=1000
-    )
-    all_points.extend(points)
-    while next_page is not None:
-        points, next_page = client.scroll(
-            collection_name=source_collection,
-            with_payload=True,
-            with_vectors=False,
-            limit=1000,
-            offset=next_page
-        )
-        all_points.extend(points)
-
-    # Unified regex for timestamp, pid, loglevel, and text
-    time_pattern = re.compile(
-        r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\s+UTC\s+\[(\d+)]\s+([A-Z]+):\s+(.+)$"
-    )
-    
-    messages = []
-    for idx, p in enumerate(all_points):
-        if not p.payload:
-            continue
-        txt = p.payload.get("text", "")
-        match = time_pattern.match(txt)
-        if not match:
-            continue
-
-        dt_str, pid_str, level, text_msg = match.groups()
+    if suffix in {".txt", ".log"}:
+        with open(tmp_path, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+    elif suffix == ".csv":
         try:
-            dt_obj = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=timezone.utc)
-            ts = int(dt_obj.timestamp())
+            df = pd.read_csv(tmp_path)
+            text = df.to_string(index=False)
+        except Exception as e:
+            st.error(f"CSV parsing error: {e}")
+            return ""
+    elif suffix == ".pdf":
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(tmp_path)
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
         except Exception:
-            continue
+            st.error("PDF parsing requires 'pypdf'.")
+            return ""
+    elif suffix == ".docx":
+        try:
+            import docx2txt
+            text = docx2txt.process(tmp_path)
+        except Exception:
+            st.error("DOCX parsing requires 'docx2txt'.")
+            return ""
+    else:
+        st.error("Unsupported file format. Use .txt/.log/.csv/.pdf/.docx")
+        return ""
 
-        messages.append({
-            "id": f"{p.id}_{ts}_{idx}",
-            "timestamp": ts,
-            "raw_timestamp": dt_str,
-            "pid": int(pid_str),
-            "text": text_msg.strip(),
-            "log_level": level.upper()
-        })
-
-    # Sort messages chronologically
-    messages_sorted = sorted(messages, key=lambda x: x["timestamp"])
-    timestamps_sorted = [m["timestamp"] for m in messages_sorted]
-
-    # Group by (template_text, log_level)
-    text_loglevel_groups = defaultdict(list)
-    for msg in messages_sorted:
-        # Normalize template by stripping numbers (like IDs, query IDs, etc.)
-        template_text = re.sub(r"\d+", "<NUM>", msg["text"]).strip()
-        key = (template_text, msg["log_level"])
-        text_loglevel_groups[key].append(msg)
-
-    # Build clusters
-    clusters = []
-    for (template_text, log_level), msgs in text_loglevel_groups.items():
-        cluster_messages = []
-        seen_ids = set()
-        for m in msgs:
-            ts = m["timestamp"]
-            if m["id"] not in seen_ids:
-                cluster_messages.append(m)
-                seen_ids.add(m["id"])
-            start_idx = bisect.bisect_left(timestamps_sorted, ts - window)
-            end_idx = bisect.bisect_right(timestamps_sorted, ts + window)
-            for n in messages_sorted[start_idx:end_idx]:
-                if n["id"] not in seen_ids:
-                    cluster_messages.append(n)
-                    seen_ids.add(n["id"])
-        clusters.append({
-            "cluster_id": hash((template_text, log_level)) % (10**12),
-            "anchor_text": template_text,
-            "log_level": log_level,
-            "messages": cluster_messages,
-            "profiling": {"cluster_size": len(cluster_messages)}
-        })
-
-    # Recreate profile collection
-    if client.collection_exists(profile_collection):
-        client.delete_collection(profile_collection)
-    client.create_collection(
-        collection_name=profile_collection,
-        vectors_config=VectorParams(
-            size=embedder.get_sentence_embedding_dimension(),
-            distance=Distance.COSINE
-        )
-    )
-
-    # Insert clusters
-    for cluster in clusters:
-        cluster_text = " ".join([m["text"] for m in cluster["messages"]])
-        vector = embedder.encode(cluster_text).tolist()
-        client.upsert(
-            collection_name=profile_collection,
-            points=[PointStruct(id=cluster["cluster_id"], vector=vector, payload=cluster)]
-        )
-
-    # Save locally
-    with open("text_loglevel_clusters.json", "w") as f:
-        json.dump(clusters, f, indent=4)
-
-    return len(clusters)
-
-def extract_date_from_query(query):
+    # Clean up temporary file
     try:
-        return parse(query, fuzzy=True).strftime('%Y-%m-%d')
+        os.remove(tmp_path)
+    except Exception:
+        pass
+
+    return text
+
+def get_file_hash(file):
+    """Generate a hash for the uploaded file content"""
+    file.seek(0)
+    data = file.read()
+    file.seek(0)
+    return hashlib.md5(data).hexdigest()
+
+st.markdown("""
+<style>
+    /* Remove top padding from sidebar container */
+    [data-testid="stSidebar"] > div:first-child {
+        padding-top: 0rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# ------------------- Sidebar Heading -------------------
+st.sidebar.markdown("""
+<div style="margin-top:0px; text-align:center;">
+    <h4 style='font-size:16px; margin:0; padding:0;'>🔎 Askpglog - PostgreSQL Log Analyzer</h4>
+</div>
+""", unsafe_allow_html=True)
+
+# Add a vertical gap (you can adjust height in px)
+st.sidebar.markdown("<div style='height:20px;'></div>", unsafe_allow_html=True)
+
+# ------------------- File uploader -------------------
+if "uploaded_data" not in st.session_state:
+    st.session_state.uploaded_data = {}
+
+uploaded_files = st.sidebar.file_uploader(
+    "📁 Upload log files",
+    type=["txt", "log", "pdf", "docx", "csv"],
+    accept_multiple_files=True
+)
+
+# -------------------------
+# Qdrant upsert with retries/backoff
+# -------------------------
+def qdrant_upsert_points(points_batch):
+    last_err = None
+    for attempt in range(1, QDRANT_MAX_RETRIES + 1):
+        try:
+            client.upsert(collection_name=COLLECTION, points=points_batch, wait=False)
+            return
+        except Exception as e:
+            last_err = e
+            sleep_s = (QDRANT_BACKOFF_BASE ** attempt) + random.uniform(0, 0.5)
+            sleep_s = min(sleep_s, 20.0)
+            try: st.warning(f"Qdrant upsert retry {attempt}/{QDRANT_MAX_RETRIES} in ~{sleep_s:.1f}s ({type(e).__name__})")
+            except Exception: pass
+            time.sleep(sleep_s)
+    raise RuntimeError(f"Qdrant upsert failed after {QDRANT_MAX_RETRIES} retries: {last_err}")
+
+# -------------------------
+# Indexing (FAST or FULL) + severity filter
+# -------------------------
+def upsert_events_qdrant(
+    events,
+    shard_size: int = SHARD_SIZE,
+    fast_mode: bool = True,
+    only_levels: set[str] | None = None
+):
+    if not events:
+        return 0
+    if only_levels:
+        events = [e for e in events if (e.get("level") or "").upper() in only_levels]
+        if not events:
+            return 0
+
+    total_upserts = 0
+    first_dim = None
+
+    if QDRANT_RESET and client.collection_exists(COLLECTION):
+        client.delete_collection(COLLECTION)
+
+    for s in range(0, len(events), shard_size):
+        slice_events = events[s:s+shard_size]
+        full_texts = [build_full_text(e) for e in slice_events]
+        tpl_texts  = [fingerprint_text(t) for t in full_texts]
+
+        if fast_mode:
+            # deduplicate templates
+            uniq_tpl = {}
+            for idx, t in enumerate(tpl_texts):
+                uniq_tpl.setdefault(t, []).append(idx)
+
+            uniq_keys = list(uniq_tpl.keys())
+            tpl_vecs_unique = embed_texts(uniq_keys)  # cached!
+
+            dim = int(tpl_vecs_unique.shape[1])
+            if first_dim is None:
+                first_dim = dim
+                recreate_base_collection(dim, fast=True)
+
+            # map unique vecs back to all events
+            vecs_tpl = [None] * len(slice_events)
+            for k_idx, key in enumerate(uniq_keys):
+                v = tpl_vecs_unique[k_idx]
+                for event_idx in uniq_tpl[key]:
+                    vecs_tpl[event_idx] = v
+
+            points = []
+            for e, v_tpl, t_full, t_tpl in zip(slice_events, vecs_tpl, full_texts, tpl_texts):
+                pid = make_point_id(e)
+                payload = {
+                    "ts": int(e["ts"].timestamp()),
+                    "ts_str": e["ts"].strftime("%Y-%m-%d %H:%M:%S.%f"),
+                    "tz": e.get("tz"),
+                    "pid": e.get("pid"),
+                    "ident": e.get("ident"),
+                    "host_ip": e.get("host_ip"),
+                    "port": e.get("port"),
+                    "level": e.get("level"),
+                    "message": e.get("message"),
+                    "detail": e.get("detail"),
+                    "statement": e.get("statement"),
+                    "full_text": t_full,
+                    "template_text": t_tpl,
+                }
+                vec = {"text_tpl": np.asarray(v_tpl, dtype="float32").tolist()}
+                points.append(PointStruct(id=pid, vector=vec, payload=payload))
+
+        else:
+            # FULL mode: two vectors per point
+            full_vecs = embed_texts(full_texts)
+            tpl_vecs  = embed_texts(tpl_texts)
+
+            dim = int(full_vecs.shape[1])
+            if first_dim is None:
+                first_dim = dim
+                if not client.collection_exists(COLLECTION):
+                    recreate_base_collection(dim, fast=False)
+
+            points = []
+            for e, v_full, v_tpl, t_full, t_tpl in zip(slice_events, full_vecs, tpl_vecs, full_texts, tpl_texts):
+                pid = make_point_id(e)
+                payload = {
+                    "ts": int(e["ts"].timestamp()),
+                    "ts_str": e["ts"].strftime("%Y-%m-%d %H:%M:%S.%f"),
+                    "tz": e.get("tz"),
+                    "pid": e.get("pid"),
+                    "ident": e.get("ident"),
+                    "host_ip": e.get("host_ip"),
+                    "port": e.get("port"),
+                    "level": e.get("level"),
+                    "message": e.get("message"),
+                    "detail": e.get("detail"),
+                    "statement": e.get("statement"),
+                    "full_text": t_full,
+                    "template_text": t_tpl,
+                }
+                vec = {
+                    "text_full": np.asarray(v_full, dtype="float32").tolist(),
+                    "text_tpl":  np.asarray(v_tpl,  dtype="float32").tolist()
+                }
+                points.append(PointStruct(id=pid, vector=vec, payload=payload))
+
+        # batched upserts
+        B = max(64, QDRANT_BATCH)
+        for i in range(0, len(points), B):
+            qdrant_upsert_points(points[i:i+B])
+
+        total_upserts += len(points)
+        try: st.info(f"Indexed shard {s//shard_size + 1} — {len(points)} events (total {total_upserts}).")
+        except Exception: pass
+
+    return total_upserts
+
+# -------------------------
+# Vector name detection (supports older/newer clients)
+# -------------------------
+def detect_vector_name_for_collection(collection: str) -> str | None:
+    """
+    Returns a named vector to use (e.g., 'text_full' or 'text_tpl').
+    If the collection only has a single *unnamed* vector, returns None.
+    Works across qdrant-client versions.
+    """
+    try:
+        info = client.get_collection(collection)
+        names: set[str] = set()
+
+        # Newer: sometimes expose dict under .vectors_config
+        vconf = getattr(info, "vectors_config", None)
+        if isinstance(vconf, dict):
+            names.update(vconf.keys())
+
+        # Portable path (older clients): .config.params.vectors
+        cfg = getattr(info, "config", None)
+        params = getattr(cfg, "params", None) if cfg else None
+        vecs = getattr(params, "vectors", None) if params else None
+
+        # If vecs is a dict ⇒ named vectors; if it's VectorParams ⇒ single unnamed vector
+        if isinstance(vecs, dict):
+            names.update(vecs.keys())
+
+        if "text_full" in names:
+            return "text_full"
+        if "text_tpl" in names:
+            return "text_tpl"
+        if names:
+            return sorted(names)[0]
+
+        # No named vectors detected ⇒ likely single unnamed vector
+        return None
     except Exception:
         return None
 
-def qdrant_search(query, k=200, sim_threshold=0.15):
-    target_date = extract_date_from_query(query)
-    date_only_mode = False
+# -------------------------
+# Search / Context
+# -------------------------
+def qdrant_semantic_search(
+    query: str,
+    top_k: int = 50,
+    level: str | None = None,
+    t_start: int | None = None,
+    t_end: int | None = None
+):
+    qv = embed_texts([query])[0].tolist()
 
-    if target_date and any(
-        phrase in query.lower()
-        for phrase in ["from", "since", "after", "on", "logs from", "show logs from"]
-    ) and not any(kw in query.lower() for kw in ["error", "fail", "division", "crash", "panic"]):
-        date_only_mode = True
+    must = []
+    if level:
+        must.append(FieldCondition(key="level", match={"value": level}))
+    if t_start or t_end:
+        must.append(FieldCondition(key="ts", range=Range(gte=t_start, lte=t_end)))
+    flt = Filter(must=must) if must else None
 
-    if target_date and date_only_mode:
-        conn = connect_pg()
-        with conn.cursor() as cur:
-            cur.execute(f"""
-                SELECT message, pid, level, timestamp
-                FROM {TABLE_NAME}
-                WHERE DATE(timestamp) >= %s
-                ORDER BY timestamp ASC
-            """, (target_date,))
-            rows = cur.fetchall()
-        conn.close()
+    vec_name = detect_vector_name_for_collection(COLLECTION)
 
-        if not rows:
-            return []
+    if vec_name is None:
+        # Single unnamed vector → pass raw vector
+        return client.search(
+            collection_name=COLLECTION,
+            query_vector=qv,
+            query_filter=flt,
+            with_payload=True,
+            limit=top_k
+        )
 
-        texts = [
-            f"{row[3].strftime('%Y-%m-%d %H:%M:%S.%f')} UTC [{row[1]}] {row[2]}: {row[0]}"
-            for row in rows
-        ]
-    else:
-        texts = st.session_state.get("texts", [])
-        if not texts:
-            return []
-
-    query_vec = embedder.encode([query])[0]
-    embeddings = embedder.encode(texts, show_progress_bar=False)
-    sim_scores = cosine_similarity([query_vec], embeddings).flatten()
-
-    filtered = [(t, s) for t, s in zip(texts, sim_scores) if s >= sim_threshold]
-
-    if not filtered:
-        return []
-
-    filtered.sort(key=lambda x: x[1], reverse=True)
-
-    top_results = [t for t, _ in filtered[:k]]
-
-    top_results.sort(key=extract_log_ts)
-
-    return top_results
-
-def extract_log_ts(log):
+    # Named vector
     try:
-        ts_str = log.split(" UTC")[0].strip()
-        return datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S.%f")
-    except ValueError:
-        try:
-            return datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-        except:
-            return None
-
-def normalize_for_embedding(log):
-    """
-    Keep only severity + message, drop timestamp/PID.
-    Example: "ERROR: could not connect to server: Connection refused"
-    """
-    try:
-        return log.split("] ", 1)[1] 
+        return client.search(
+            collection_name=COLLECTION,
+            query_vector=(vec_name, qv),
+            query_filter=flt,
+            with_payload=True,
+            limit=top_k
+        )
     except Exception:
-        return log
+        # Defensive fallback
+        return client.search(
+            collection_name=COLLECTION,
+            query_vector=qv,
+            query_filter=flt,
+            with_payload=True,
+            limit=top_k
+        )
 
-def cluster_logs(logs, n_clusters=10):
-    if not logs:
-        return []
-
-    norm_texts = [normalize_for_embedding(l) for l in logs]
-    embeddings = embedder.encode(norm_texts, show_progress_bar=False)
-
-    k = min(n_clusters, len(logs))
-    kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-    labels = kmeans.fit_predict(embeddings)
-    clusters = defaultdict(list)
-    for label, log in zip(labels, logs):
-        clusters[label].append(log)
-    clustered_results = [sorted(group, key=extract_log_ts) for group in clusters.values()]
-
-    return clustered_results
-
-st.set_page_config(page_title="Hybrid Log Search", layout="wide")
-st.title("📚 Hybrid Log Search (Qdrant) ")
-st.markdown("Upload a PostgreSQL log file")
-
-
-
-uploaded_file = st.file_uploader("📁 Upload a .txt, .pdf, or .docx file", type=["txt", "pdf", "docx"])
-
-# Function to color log messages based on their level
-def color_log_message(level, message):
-    if level == "ERROR":
-        return f'<span style="color:red;">{message}</span>'
-    elif level == "WARNING":
-        return f'<span style="color:orange;">{message}</span>'
-    elif level == "INFO":
-        return f'<span style="color:green;">{message}</span>'
-    else:
-        return message  # Default to black for other levels
-
-# Example usage in log display
-for log in logs:
-    st.markdown(color_log_message(log.level, log.message), unsafe_allow_html=True)
-
-
-if uploaded_file:
-    if "uploaded_file_name" not in st.session_state or st.session_state.uploaded_file_name != uploaded_file.name:
-        with st.spinner("📥 Parsing and inserting logs into database..."):
-            parsed_entries = load_and_parse_file(uploaded_file)
-            ensure_table_exists()
-            st.info("Table is ready")
-            # Now insert logs
-            inserted_count = insert_logs_pg(parsed_entries)
-            
-            if inserted_count > 0:
-                st.success(f"✅ Inserted {inserted_count} new log entries into PostgreSQL.")
-                st.session_state.indexed = False 
-            else:
-                st.info("ℹ️ No new entries inserted. Skipping indexing.")
-
-            st.session_state.uploaded_file_name = uploaded_file.name
-            st.session_state.uploaded_handled = True
-
-    if not st.session_state.get("indexed", False):
-        with st.spinner("⚙️ Indexing logs for search..."):
-            all_logs = load_logs_from_db()
-            index_texts(all_logs)
-            cluster_status = st.empty()         
-            build_text_loglevel_clusters_v2()         
-            st.session_state.indexed = True
-            st.success("✅ Indexing complete and ready for querying.")
-
-else:
-    st.info("📂 Please upload a file to insert and index logs.")
-
-def query_cluster_profiles(user_query, top_k=10):
-    """Semantic search on clusters in text_loglevel_clusterss collection."""
-    q_vector = embedder.encode(user_query).tolist()  
-
-    results = client.search(
-        collection_name="text_loglevel_clusterss",
-        query_vector=q_vector,
-        limit=top_k,
-        with_payload=True
+def expand_context_around_hit(hit, window_seconds=3600):
+    ts = hit.payload["ts"]
+    flt = Filter(must=[FieldCondition(key="ts", range=Range(gte=ts-window_seconds, lte=ts+window_seconds))])
+    out, _ = client.scroll(
+        collection_name=COLLECTION,
+        limit=2000,
+        with_payload=True,
+        with_vectors=False,
+        scroll_filter=flt
     )
+    out = sorted(out, key=lambda p: (p.payload.get("ts", 0), p.payload.get("pid") or 0))
+    return out
 
-    if not results:
+# -------------------------
+# Deadlock helpers (NEW)
+# -------------------------
+DEADLOCK_LINE_RE = re.compile(r'\bdeadlock detected\b', re.I)
+DEADLOCK_DETAIL_PAIR_RE = re.compile(
+    r'Process\s+(?P<waiter>\d+)\s+waits.*?transaction\s+(?P<txid>\d+);.*?blocked by process\s+(?P<blocker>\d+)',
+    re.I
+)
+
+def extract_deadlock_participants(payload_detail: str) -> dict:
+    """Return {'pairs': [(waiter_pid, blocker_pid, txid), ...], 'pids': {pid1, pid2}}."""
+    pairs = []
+    pids = set()
+    if not payload_detail:
+        return {"pairs": [], "pids": set()}
+    for m in DEADLOCK_DETAIL_PAIR_RE.finditer(payload_detail):
+        w = int(m.group('waiter')); b = int(m.group('blocker')); txid = int(m.group('txid'))
+        pairs.append((w, b, txid))
+        pids.add(w); pids.add(b)
+    return {"pairs": pairs, "pids": pids}
+
+def get_deadlock_hits_from_search(hits):
+    """Pick the first hit whose message contains 'deadlock detected' (case-insensitive)."""
+    for h in hits or []:
+        msg = (h.payload or {}).get("message", "") or ""
+        if DEADLOCK_LINE_RE.search(msg):
+            return h
+    return None
+
+def fetch_pid_window(ts_center: int, pids: set[int], window_seconds: int = 120):
+    """Fetch events around ts for the given PIDs. We scroll by time and filter PIDs locally."""
+    if not pids:
         return []
+    flt = Filter(must=[FieldCondition(key="ts", range=Range(gte=ts_center-window_seconds, lte=ts_center+window_seconds))])
+    out, next_page = client.scroll(COLLECTION, limit=2000, with_payload=True, with_vectors=False, scroll_filter=flt)
+    all_pts = list(out)
+    while next_page:
+        out, next_page = client.scroll(COLLECTION, limit=2000, with_payload=True, with_vectors=False, scroll_filter=flt, offset=next_page)
+        all_pts.extend(out)
+    # keep only our PIDs
+    all_pts = [p for p in all_pts if (p.payload or {}).get("pid") in pids]
+    all_pts.sort(key=lambda p: (p.payload.get("ts", 0), p.payload.get("pid") or 0))
+    return all_pts
 
-    clusters = [r.payload for r in results]
-    return clusters
+def find_last_statement_before(ts_center: int, points_for_pid: list):
+    """Return the last statement text at or before ts_center from a PID's points."""
+    last_stmt = None
+    last_stmt_ts = None
+    for p in points_for_pid:
+        ts = p.payload.get("ts", 0)
+        if ts > ts_center:
+            break
+        stmt = p.payload.get("statement")
+        if stmt:
+            last_stmt = stmt
+            last_stmt_ts = ts
+        else:
+            ft = (p.payload or {}).get("full_text", "")
+            m = re.search(r'\bSTATEMENT:\s+(.*)$', ft, re.I | re.M)
+            if m:
+                last_stmt = m.group(1).strip()
+                last_stmt_ts = ts
+    return last_stmt_ts, last_stmt
 
-query = st.text_input("🔎 paste any log message:")
-search_clicked = st.button("Search")
+def render_deadlock_report(deadlock_hit, context_points):
+    """Print a crisp, non-LLM report with exact SQLs."""
+    pl = deadlock_hit.payload or {}
+    ts = pl.get("ts"); ts_str = pl.get("ts_str")
+    detail = pl.get("detail", "") or ""
+    parts = extract_deadlock_participants(detail)
+    pids = parts["pids"]
+    pairs = parts["pairs"]
 
-if search_clicked and query and st.session_state.get("indexed"):
-    with st.spinner("🔍 Searching logs..."):
+    st.markdown("## 🔒 Deadlock detected")
+    st.code(pl.get("full_text", "")[:2000], language="text")
+    if detail:
+        st.write("**DETAIL:**")
+        st.code(detail[:2000], language="text")
 
-        dt_obj = None
-        try:
-            dt_obj = parser.parse(query, fuzzy=True)
-            if dt_obj.tzinfo is None:
-                dt_obj = dt_obj.replace(tzinfo=timezone.utc)
-        except Exception:
-            dt_obj = None
+    # Split context by PID
+    by_pid = defaultdict(list)
+    for p in context_points:
+        by_pid[p.payload.get("pid")].append(p)
 
-        clusters = query_cluster_profiles(query, top_k=5)
-        all_cluster_logs = []
+    st.markdown("### 🧭 Context (±120s) by PID")
+    for pid, rows in by_pid.items():
+        st.markdown(f"**PID {pid}**")
+        for r in rows:
+            st.text(r.payload.get("full_text", "")[:2000])
 
-        for i, cluster in enumerate(clusters, 1):
-            st.markdown(f"### 🧠 Cluster Result {i}")
-            st.markdown(f"**Anchor Text:** {cluster.get('anchor_text', 'N/A')}")
-            st.markdown(f"**Log Level:** {cluster.get('log_level', 'N/A')}")
-            st.markdown(f"**Cluster Size:** {len(cluster.get('messages', []))} messages")
+    st.markdown("### 🧾 Involved SQL (last before deadlock)")
+    for pid in sorted(by_pid.keys()):
+        ts_stmt, stmt = find_last_statement_before(ts, by_pid[pid])
+        if stmt:
+            when = datetime.utcfromtimestamp(ts_stmt).strftime("%Y-%m-%d %H:%M:%S UTC") if ts_stmt else "(unknown)"
+            st.markdown(f"**PID {pid}** — last statement @ {when}")
+            st.code(stmt, language="sql")
+        else:
+            st.markdown(f"**PID {pid}** — *(no statement found in window; raise logging level or widen window)*")
 
-            # Collect logs from the cluster
-            for msg in cluster.get("messages", []):
-                ts = msg.get("raw_timestamp", msg.get("timestamp", "N/A"))
-                pid = msg.get("pid", "N/A")  # if you stored PID in your payload
-                level = msg.get("log_level", "UNKNOWN")
-                text = msg.get("text", "")
-                formatted_log = f"[{ts}] [{pid}] {level}: {text}"
-                st.write(f"- {formatted_log}")
-                all_cluster_logs.append(formatted_log)
+    if pairs:
+        st.markdown("### 🔁 Wait cycle")
+        for (w,b,txid) in pairs:
+            st.write(f"- Process **{w}** waits on **txid {txid}**, blocked by **{b}**")
 
-            # Now fetch similar clusters
-            cluster_text = " ".join([m.get("text", "") for m in cluster.get("messages", [])])
-            cluster_vector = embedder.encode(cluster_text).tolist()
-            similar_clusters = client.search(
-                collection_name="text_loglevel_clusterss",
-                query_vector=cluster_vector,
-                limit=5,
-                with_payload=True
-            )
+    st.markdown("### ✅ Targeted fixes")
+    st.write("- Ensure consistent lock ordering across code paths touching the same rows/tables.")
+    st.write("- Keep transactions short; avoid `pg_sleep` within transactions.")
+    st.write("- If FKs are involved, index all referencing columns to reduce lock scope.")
+    st.write("- Add retry-on-deadlock with jitter to the affected statements only.")
 
-            st.markdown(f"#### 🔎 Top 4 Similar Clusters")
-            for sim in similar_clusters:
-                sim_payload = sim.payload
-                if sim_payload.get("cluster_id") == cluster.get("cluster_id"):
-                    continue
-                st.markdown(f"- **Anchor Text:** {sim_payload.get('anchor_text', 'N/A')}")
-                st.markdown(f"  **Log Level:** {sim_payload.get('log_level', 'N/A')}")
-                for msg in sim_payload.get("messages", []):
-                    ts = msg.get("raw_timestamp", msg.get("timestamp", "N/A"))
-                    pid = msg.get("pid", "N/A")
-                    level = msg.get("log_level", "UNKNOWN")
-                    text = msg.get("text", "")
-                    formatted_log = f"[{ts}] [{pid}] {level}: {text}"
-                    st.write(f"    - {formatted_log}")
-                    all_cluster_logs.append(formatted_log)
+with app_tab:
+    st.markdown('<div id="top"></div>', unsafe_allow_html=True)
 
-    all_logs_text = "\n".join(all_cluster_logs)
-    structured_logs = [l.strip() for l in all_cluster_logs]
-    all_logs_text_structured = "\n".join(f"{i+1}. {l}" for i, l in enumerate(structured_logs))
+    # ------------------- Floating "Scroll to Top" Button -------------------
+    st.markdown("""
+    <div style="
+        position: fixed; 
+        top: 8.5rem;      
+        right: 30px;      
+        z-index: 9999;
+    ">
+        <a href="#top" 
+        style="
+            background-color:#ff6b6b;  
+            color:white;
+            font-weight:bold;
+            text-decoration:none;
+            padding:12px 18px;
+            border-radius:12px;
+            font-size:16px;
+            box-shadow:0px 4px 8px rgba(0,0,0,0.2);
+            cursor:pointer;
+        ">
+            ⬆️ Scroll to top
+        </a>
+    </div>
+    """, unsafe_allow_html=True)
 
-    if query:
-        gpt_prompt = f"""
-    You are a PostgreSQL Site Reliability Engineer (SRE).
+    # ------------------- Initialize session state -------------------
+    if "uploaded_data" not in st.session_state:
+        st.session_state.uploaded_data = {}
+    if "upload_sig" not in st.session_state:
+        st.session_state.upload_sig = None
+    if "first_upload_done" not in st.session_state:
+        st.session_state.first_upload_done = False
+    if "index_ready" not in st.session_state:
+        st.session_state.index_ready = False
 
-    A user has made a query for a specific log message ("the Query Log").
+    def compute_upload_signature(files):
+        if not files:
+            return None
+        return tuple((f.name, getattr(f, "size", None)) for f in files)
 
-    The Query Log is:
-    "{query}"
+    # ------------------- File uploader UI -------------------
+    if uploaded_files:
+        st.sidebar.caption("Selected: " + ", ".join([f.name for f in uploaded_files]))
+        for uf in uploaded_files:
+            file_key = f"{uf.name}_{get_file_hash(uf)}"
+            if file_key not in st.session_state.uploaded_data:
+                st.session_state.uploaded_data[file_key] = {
+                    "name": uf.name,
+                    "content": load_uploaded_file(uf)
+                }
 
-    You are provided with the following **clustered log results**:
-    {all_logs_text_structured}
+            file_data = st.session_state.uploaded_data[file_key]
+            st.subheader(f"📄 {file_data['name']} file")
+            with st.expander("Preview file content", expanded=False):
+                st.markdown(f"""
+                <div style="
+                    max-height:400px;
+                    overflow:auto;
+                    padding:10px;
+                    border:1px solid #ddd;
+                    white-space: pre-wrap;
+                    font-family: monospace;
+                    font-size: 14px;
+                    user-select: text;
+                ">{file_data['content'][:1000000]}</div>
+                """, unsafe_allow_html=True)
 
-    Instructions:
+            if uf.name.lower().endswith(".csv"):
+                try:
+                    df = pd.read_csv(uf)
+                    st.dataframe(df)
+                except Exception:
+                    st.warning(f"Could not read CSV: {uf.name}")
 
-    1. STRICTLY use only the clusters provided above.
-    - Do NOT invent or assume any logs.
-    - Do NOT list all logs chronologically.
-    - Focus on cluster summaries (Anchor Text, Log Level, Cluster Size).
-    - Reference specific log messages only if they are critical for root cause.
+    # ------------------- Detect file changes -------------------
+    current_sig = compute_upload_signature(uploaded_files)
+    files_changed = (uploaded_files and current_sig != st.session_state.upload_sig)
 
-    2. Identify the Query Log:
-    - Find the single log that exactly matches the user's query.
-    - Copy it exactly, including timestamp, PID, level, and message.
+    # ------------------- Ingest & Index controls -------------------
+    col_btn1, col_btn2 = st.sidebar.columns(2)
+    with col_btn1:
+        ingest_click = st.button("Ingest & Index", type="primary")
+    with col_btn2:
+        auto_index_new = st.checkbox("Auto-index on change", value=True)
 
-    3. Root Cause Analysis:
-    - Identify which cluster(s) and log(s) directly caused the Query Log.
-    - Copy causal logs exactly (timestamp, PID, level, message).
-    - Do NOT include the Query Log itself as a causal log.
-    - Warnings or past events may be referenced as **secondary contributing factors** only if they are clearly related.
+    # ------------------- Determine whether to index -------------------
+    should_index_now = False
+    if uploaded_files:
+        if not st.session_state.first_upload_done:
+            should_index_now = True
+        elif auto_index_new and files_changed:
+            should_index_now = True
+        elif ingest_click:
+            should_index_now = True
 
-    4. Explanation:
-    - For each causal log, calculate the **time difference** from the Query Log precisely (e.g., "7 hours 7 minutes earlier").
-    - Explain in PostgreSQL terms: table rewrites, connection drops, transaction conflicts, disk issues, etc.
-    - Connect multiple causal logs into a **clear chain of events**.
-    - Keep explanations concise (1–2 sentences per causal log).
-    - Highlight why each causal log directly contributed to the Query Log.
+    # ------------------- Ingest -------------------
+    all_events = []
+    if should_index_now and uploaded_files:
+        ensure_table_exists()
+        for uf in uploaded_files:
+            file_key = f"{uf.name}_{get_file_hash(uf)}"
+            text = st.session_state.uploaded_data[file_key]["content"]
+            if not text:
+                continue
+            st.info(f"Parsing: {uf.name}")
+            events = parse_events(text)
+            inserted = insert_events_pg(events)
+            st.success(f"Inserted {inserted} events from {uf.name}.")
+            all_events.extend(events)
 
-    5. Possible Solution:
-    - Suggest fixes based only on the provided clusters.
-    - Include actionable PostgreSQL steps (adjust connection settings, monitor disk I/O, schedule maintenance, fix SQL issues).
+        # Update session state after successful ingestion
+        st.session_state.upload_sig = current_sig
+        st.session_state.first_upload_done = True
+        st.session_state.index_ready = True
 
-    6. Output Format:
-    - Query Log: <exact log>
-    - Root Cause: <causal logs>
-    - Explanation: <brief, PostgreSQL-aware reasoning with precise time differences>
-    - Possible Solution: <concise recommended steps>
+    # ------------------- PostgreSQL severity chart -------------------
+    conn = psycopg2.connect(
+        host="localhost",
+        port="5433",
+        dbname="tsdb",
+        user="postgres",
+        password="accesspass"
+    )
+    severity_query = """
+    SELECT level AS severity, COUNT(*) AS count
+    FROM uploaded_logs
+    GROUP BY level
+    ORDER BY
+    CASE level
+        WHEN 'PANIC' THEN 1
+        WHEN 'FATAL' THEN 2
+        WHEN 'ERROR' THEN 3
+        WHEN 'WARNING' THEN 4
+        WHEN 'NOTICE' THEN 5
+        WHEN 'INFO' THEN 6
+        WHEN 'LOG' THEN 7
+        WHEN 'DEBUG' THEN 8
+        ELSE 9
+    END
     """
+    logs_df = pd.read_sql(severity_query, conn)
+    conn.close()
 
-        try:
-            chat_model = ChatOpenAI(
-                temperature=0,
-                model="gpt-4o-mini",
-                openai_api_key=OPENAI_API_KEY,
-                max_tokens=1500
+    severity_order = ["PANIC", "FATAL", "ERROR", "WARNING", "NOTICE", "INFO", "LOG", "DEBUG"]
+    logs_df = logs_df.set_index('severity').reindex(severity_order, fill_value=0).reset_index()
+
+    col1, col2 = st.columns([2,1])
+    with col2:
+        SHOW_ZERO_COUNTS = st.checkbox("Show severities with 0 count", value=True)
+
+    display_df = logs_df[logs_df['count']>0] if not SHOW_ZERO_COUNTS else logs_df.copy()
+    total_row = pd.DataFrame([{'severity': 'TOTAL', 'count': display_df['count'].sum()}])
+    logs_df_total = pd.concat([display_df, total_row], ignore_index=True)
+
+    def highlight_total(row):
+        return ['font-weight: bold']*len(row) if row['severity']=='TOTAL' else ['']*len(row)
+
+    styled_logs_df = logs_df_total.style.apply(highlight_total, axis=1)
+
+    with col1:
+        colors_reversed = px.colors.sequential.YlOrRd[::-1]
+        fig = px.bar(
+            display_df,
+            x='severity',
+            y='count',
+            text='count',
+            title='PostgreSQL Log Severity Counts',
+            color='severity',
+            color_discrete_sequence=colors_reversed
+        )
+        fig.update_traces(textposition='outside', hovertemplate='Severity: %{x}<br>Count: %{y}')
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col2:
+        st.dataframe(styled_logs_df.hide(axis="columns"), use_container_width=True)
+
+    st.divider()
+
+    # ------------------- Qdrant indexing -------------------
+    if should_index_now and uploaded_files:
+        with st.spinner("Indexing to Qdrant..."):
+            count = upsert_events_qdrant(
+                all_events if all_events else load_events_from_db(),
+                shard_size=SHARD_SIZE,
+                fast_mode=fast_mode_ui,
+                only_levels=set(only_lvls) if only_lvls else None
             )
+            st.success(f"Indexed/Upserted {count} events to Qdrant ({COLLECTION}).")
 
-            response = chat_model([
-                HumanMessage(content="You are a PostgreSQL SRE. Analyze clustered logs efficiently, focusing on key clusters and causal logs with precise time-aware explanations."),
-                HumanMessage(content=gpt_prompt)
-            ])
+        st.session_state.upload_sig = current_sig
+        st.session_state.index_ready = True
+    else:
+        if qdrant_index_exists():
+            st.info("Using existing Qdrant index. Click **Ingest & Index** to re-index.")
+            st.session_state.index_ready = True
+        else:
+            st.warning("No Qdrant index found yet. Upload logs and click **Ingest & Index**.")
+            st.session_state.index_ready = False
 
-            st.markdown("### 🧠 Log Analysis Summary & Root Cause")
-            st.markdown(response.content.strip())
+    # -------------------------
+    # Search panel
+    # -------------------------
+    q = st.text_input("Type a question or paste a log line")
 
-        except Exception as e:
-            st.error(f"❌ GPT analysis failed: {e}")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        level = st.selectbox("Filter by level", ["(any)", "LOG", "ERROR", "WARNING", "FATAL", "PANIC"])
+        level_f = None if level == "(any)" else level
+    with c2:
+        start_str = st.text_input("Start time (optional, e.g. 2025-09-06 20:23)")
+    with c3:
+        end_str = st.text_input("End time (optional, e.g. 2025-09-06 20:25)")
+
+    # Initialize session state flags
+
+    if "last_hits" not in st.session_state:
+        st.session_state.last_hits = None
+    if "show_summary_button" not in st.session_state:
+        st.session_state.show_summary_button = False
+    if "expander_open" not in st.session_state:
+        st.session_state.expander_open = True
+
+    # -------------------------
+    # Search Button
+    # -------------------------
+    if st.button("Search"):
+        if not q:
+            st.warning("Enter a query.")
+        elif not st.session_state.get("index_ready", False):
+            st.error("No index available yet. Upload logs and click **Ingest & Index** first.")
+        else:
+            # Parse time filters
+            try:
+                t_start = int(dtparser.parse(start_str).timestamp()) if start_str.strip() else None
+            except Exception:
+                t_start = None
+            try:
+                t_end = int(dtparser.parse(end_str).timestamp()) if end_str.strip() else None
+            except Exception:
+                t_end = None
+
+            with st.spinner("Searching events..."):
+                hits = qdrant_semantic_search(q, top_k=50, level=level_f, t_start=t_start, t_end=t_end)
+
+            if not hits:
+                st.info("No results.")
+            else:
+                st.session_state.last_hits = hits
+
+                # -------------------------
+                # Search Results in Expander
+                # -------------------------
+                with st.expander("📑 Search Results (expand/collapse)", expanded=True):
+                    deadlock_hit = get_deadlock_hits_from_search(hits)
+
+                    if deadlock_hit:
+                        dl_ts = (deadlock_hit.payload or {}).get("ts")
+                        detail = (deadlock_hit.payload or {}).get("detail", "") or ""
+                        parts = extract_deadlock_participants(detail)
+                        pids = parts["pids"]
+                        ctx = fetch_pid_window(dl_ts, pids, window_seconds=120)
+                        render_deadlock_report(deadlock_hit, ctx)
+                    else:
+                        top = hits[0]
+                        ctx = expand_context_around_hit(top, window_seconds=3600)
+
+                        st.markdown("### 🎯 Top Match")
+                        st.code(top.payload.get("full_text", ""), language="text")
+
+                        st.markdown("### 🧭 Context (±60 minutes)")
+                        for p in ctx:
+                            st.text(p.payload.get("full_text", "")[:2000])
+
+                # Update expander state in session
+                st.session_state.expander_open = False  # Assume user read it if search finished
+
+    # -------------------------
+    # Placeholder for Summary Section
+    # -------------------------
+    st.markdown('<div id="summary_section"></div>', unsafe_allow_html=True)
+
+    # -------------------------
+    # Floating "Go to Summary" Button
+    # -------------------------
+    if st.session_state.get("last_hits"):
+        st.markdown("""
+        <div style="
+            position: fixed; 
+            bottom: 30px; 
+            right: 30px; 
+            z-index: 9999;
+        ">
+            <a href="#summary_section" 
+            onclick="window.parent.postMessage({{'show_summary': true}}, '*');"
+            style="
+                    background-color:#ff6b6b;  /* light red */
+                    color:white;
+                    font-weight:bold;            /* bold letters */
+                    text-decoration:none;
+                    padding:12px 18px;
+                    border-radius:12px;
+                    font-size:16px;
+                    box-shadow:0px 4px 8px rgba(0,0,0,0.2);
+                ">
+                ✨ Go to Summary
+            </a>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown('<div id="top"></div>', unsafe_allow_html=True)
+   
+    # -------------------------
+    # Listen for floating button click via query param (hack)
+    # -------------------------
+    # Streamlit cannot directly capture JS postMessage, so we simulate by user clicking the anchor
+    # For simplicity, let's show summary button if expander is closed or search completed
+    if st.session_state.last_hits and (not st.session_state.expander_open or st.session_state.show_summary_button):
+        if st.button("✨ Generate Summary", key="summary_button"):
+            if not OPENAI_API_KEY:
+                st.error("OPENAI_API_KEY not set.")
+            else:
+                with st.spinner("Summarizing with OpenAI..."):
+                    try:
+                        summary_chunks = [
+                            h.payload.get("full_text", "")[:1500]
+                            for h in st.session_state.last_hits[:5]
+                        ]
+                        corpus = "\n\n---\n\n".join(summary_chunks) if summary_chunks else "(no relevant context found)"
+
+                        system_prompt = (
+                            "You are a PostgreSQL SRE. "
+                            "Given PostgreSQL logs, produce a concise root-cause explanation and actionable steps."
+                        )
+                        user_prompt = (
+                            f"Query:\n{q}\n\n"
+                            f"Relevant logs:\n{corpus}\n\n"
+                            "Return: Root Cause, Evidence (with timestamps), and 3 actionable fixes."
+                        )
+
+                        content = call_openai_chat([
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt}
+                        ])
+
+                        st.subheader("✅ Root Cause Summary")
+                        st.markdown(content)
+
+                    except Exception as e:
+                        st.error(f"LLM summarization failed: {e}")
 
