@@ -62,52 +62,53 @@ st.set_page_config(page_title="Askpglog", layout="wide")
 
 # -------------------------
 # PostgreSQL settings
-PG_HOST = "localhost"
-PG_DB = "tsdb"
-PG_USER = "postgres"
-PG_PASSWORD = "accesspass"
-PG_PORT = 5433
-TABLE_NAME = "uploaded_logs"
+PG_HOST = os.environ["PG_HOST"]
+PG_DB = os.environ["PG_DB"]
+PG_USER = os.environ["PG_USER"]
+PG_PASSWORD = os.environ["PG_PASSWORD"]
+PG_PORT = int(os.environ.get("PG_PORT", "5432"))
+TABLE_NAME = os.environ.get("TABLE_NAME", "uploaded_logs")
 
 # Embeddings
-EMBED_BACKEND = "openai"  # "openai" or "st"
-OPENAI_EMBED_MODEL = "text-embedding-3-small"  # 1536 dims
-OPENAI_CHAT_MODEL = "gpt-4o-mini"
+EMBED_BACKEND = os.getenv("EMBED_BACKEND", "openai").lower()  # "openai" or "st"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")  # 1536 dims
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
 
-# Optional ST fallback (only if EMBED_BACKEND="st")
-EMBEDDER_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+# Optional ST fallback (only if EMBED_BACKEND=st)
+EMBEDDER_MODEL = os.getenv("EMBEDDER_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 embedder = None
 
 # OpenAI embed tuning
-OPENAI_TIMEOUT = 120
-OPENAI_MAX_RETRIES = 6
-OPENAI_BATCH = 128            # bump default for speed
-OPENAI_MIN_BATCH = 16         # safe floor
-OPENAI_BACKOFF_BASE = 1.8
+OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "120"))
+OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "6"))
+OPENAI_BATCH = int(os.getenv("OPENAI_BATCH", "128"))            # bump default for speed
+OPENAI_MIN_BATCH = int(os.getenv("OPENAI_MIN_BATCH", "16"))     # safe floor
+OPENAI_BACKOFF_BASE = float(os.getenv("OPENAI_BACKOFF_BASE", "1.8"))
 
 # Fast indexing + cache
-FAST_INDEX = True
-CACHE_EMB = True
-EMB_CACHE_PATH = "emb_cache.sqlite"  # persisted across runs
+FAST_INDEX = os.getenv("FAST_INDEX", "true").lower() in {"1","true","yes"}
+CACHE_EMB = os.getenv("CACHE_EMB", "true").lower() in {"1","true","yes"}
+EMB_CACHE_PATH = os.getenv("EMB_CACHE_PATH", "emb_cache.sqlite")  # persisted across runs
 
 # Qdrant
-COLLECTION = "pg_logs"
-CLUSTER_COLLECTION = "pg_log_clusters"
+COLLECTION = os.getenv("QDRANT_COLLECTION", "pg_logs")
+CLUSTER_COLLECTION = os.getenv("QDRANT_CLUSTER_COLLECTION", "pg_log_clusters")
 
-QDRANT_URL = None
-QDRANT_HOST = "localhost"
-QDRANT_PORT = 6333
-QDRANT_GRPC = True
-QDRANT_GRPC_PORT = 6334
-QDRANT_TIMEOUT = 180           # bump default for long writes
-QDRANT_BATCH = 1000            # bigger batches = fewer calls
-QDRANT_MAX_RETRIES = 6
-QDRANT_BACKOFF_BASE = 1.8
-USE_SPARSE = False
-QDRANT_RESET = False
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_HOST = os.getenv("QDRANT_HOST", "qdrant")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
+QDRANT_GRPC = os.getenv("QDRANT_GRPC", "true").lower() in {"1", "true", "yes"}
+QDRANT_GRPC_PORT = int(os.getenv("QDRANT_GRPC_PORT", "6334"))
+QDRANT_TIMEOUT = int(os.getenv("QDRANT_TIMEOUT", "180"))         # bump default for long writes
+QDRANT_BATCH = int(os.getenv("QDRANT_BATCH", "1000"))            # bigger batches = fewer calls
+QDRANT_MAX_RETRIES = int(os.getenv("QDRANT_MAX_RETRIES", "6"))
+QDRANT_BACKOFF_BASE = float(os.getenv("QDRANT_BACKOFF_BASE", "1.8"))
+USE_SPARSE = os.getenv("USE_SPARSE", "false").lower() in {"1", "true", "yes"}
+QDRANT_RESET = os.getenv("QDRANT_RESET", "false").lower() in {"1", "true", "yes"}
 
 # Shard size
-SHARD_SIZE = 3000
+SHARD_SIZE = int(os.getenv("SHARD_SIZE", "3000"))  # larger shards reduce per-shard overhead
 
 # -------------------------
 # UTIL: Wait for Qdrant (HTTP ping)
@@ -1314,9 +1315,9 @@ with app_tab:
             st.success(f"Inserted {inserted} events from {uf.name}.")
             all_events.extend(events)
 
-    # Create SQLAlchemy engine
-    engine = create_engine("postgresql+psycopg2://postgres:accesspass@localhost:5433/tsdb")
-
+    engine = create_engine(
+        f"postgresql+psycopg2://{PG_USER}:{PG_PASSWORD}@{PG_HOST}:{PG_PORT}/{PG_DB}"
+    )
     severity_query = """
     SELECT level AS severity, COUNT(*) AS count
     FROM uploaded_logs
