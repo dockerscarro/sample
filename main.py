@@ -29,13 +29,13 @@ from dateutil import parser as dtparser
 
 import pandas as pd
 import plotly.express as px
-import csv
 
 import numpy as np
 import psycopg2
 import requests
 import streamlit as st
 import textwrap
+from sqlalchemy import create_engine
 
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import (
@@ -136,8 +136,10 @@ def connect_pg():
     )
 
 def ensure_table_exists():
+    TABLE_NAME = "uploaded_logs"
     conn = connect_pg()
     with conn.cursor() as cur:
+        # 1️⃣ Create table if it doesn't exist
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
                 raw_line   TEXT,
@@ -153,6 +155,9 @@ def ensure_table_exists():
                 statement  TEXT
             )
         """)
+        conn.commit()
+
+        # 2️⃣ Get existing columns
         cur.execute("""
             SELECT column_name
             FROM information_schema.columns
@@ -161,10 +166,12 @@ def ensure_table_exists():
         """, (TABLE_NAME,))
         cols = {r[0] for r in cur.fetchall()}
 
+        # 3️⃣ Handle old "timestamp" column if it exists
         if "timestamp" in cols and "ts" not in cols:
             cur.execute(f'ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS ts TIMESTAMPTZ')
-            cur.execute(f'UPDATE {TABLE_NAME} SET ts = "timestamp" WHERE ts IS NULL')
+            cur.execute(f'UPDATE {TABLE_NAME} SET ts = "timestamp"::timestamptz WHERE ts IS NULL')
             cur.execute(f'ALTER TABLE {TABLE_NAME} DROP COLUMN "timestamp"')
+            conn.commit()
             cur.execute("""
                 SELECT column_name
                 FROM information_schema.columns
@@ -173,12 +180,17 @@ def ensure_table_exists():
             """, (TABLE_NAME,))
             cols = {r[0] for r in cur.fetchall()}
 
-        wanted = {"raw_line":"TEXT","tz":"TEXT","ident":"TEXT","host_ip":"TEXT","port":"INTEGER",
-                  "detail":"TEXT","statement":"TEXT","level":"TEXT","message":"TEXT","pid":"INTEGER","ts":"TIMESTAMPTZ"}
+        # 4️⃣ Ensure all desired columns exist
+        wanted = {
+            "raw_line":"TEXT","tz":"TEXT","ident":"TEXT","host_ip":"TEXT","port":"INTEGER",
+            "detail":"TEXT","statement":"TEXT","level":"TEXT","message":"TEXT","pid":"INTEGER","ts":"TIMESTAMPTZ"
+        }
         for cname, ctype in wanted.items():
             if cname not in cols:
                 cur.execute(f'ALTER TABLE {TABLE_NAME} ADD COLUMN {cname} {ctype}')
+        conn.commit()
 
+        # 5️⃣ Create unique index if not exists
         cur.execute(f"""
             DO $$
             BEGIN
@@ -193,6 +205,7 @@ def ensure_table_exists():
             END$$;
         """)
         conn.commit()
+
     conn.close()
 
 def insert_events_pg(events):
@@ -504,9 +517,6 @@ def make_point_id(e: dict) -> str:
     basis = f"{int(e['ts'].timestamp())}|{e.get('pid')}|{(e.get('message') or '')[:80]}"
     return str(uuid.uuid5(uuid.NAMESPACE_URL, basis))
 
-def make_cluster_id(label: int) -> str:
-    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"cluster-{label}"))
-
 # -------------------------
 # Qdrant client & collections
 # -------------------------
@@ -524,8 +534,11 @@ def qdrant_index_exists():
         return False
 
 def recreate_base_collection(dim: int, fast: bool):
+    # Delete existing collection if it exists
     if client.collection_exists(COLLECTION):
         client.delete_collection(COLLECTION)
+
+    # Prepare vector config
     if fast:
         vectors_config = {"text_tpl": VectorParams(size=dim, distance=Distance.COSINE)}
     else:
@@ -533,25 +546,21 @@ def recreate_base_collection(dim: int, fast: bool):
             "text_full": VectorParams(size=dim, distance=Distance.COSINE),
             "text_tpl":  VectorParams(size=dim, distance=Distance.COSINE),
         }
-    if USE_SPARSE:
-        client.recreate_collection(
-            collection_name=COLLECTION,
-            vectors_config=vectors_config,
-            sparse_vectors_config={"text_sparse": SparseVectorParams()}
-        )
-    else:
-        client.recreate_collection(
-            collection_name=COLLECTION,
-            vectors_config=vectors_config,
-        )
 
-def recreate_cluster_collection(dim: int):
-    if client.collection_exists(CLUSTER_COLLECTION):
-        client.delete_collection(CLUSTER_COLLECTION)
-    client.recreate_collection(
-        collection_name=CLUSTER_COLLECTION,
-        vectors_config={"centroid": VectorParams(size=dim, distance=Distance.COSINE)}
-    )
+    # Create the collection
+    if USE_SPARSE:
+        if not client.collection_exists(COLLECTION):
+            client.create_collection(
+                collection_name=COLLECTION,
+                vectors_config=vectors_config,
+                sparse_vectors_config={"text_sparse": SparseVectorParams()}
+            )
+    else:
+        if not client.collection_exists(COLLECTION):
+            client.create_collection(
+                collection_name=COLLECTION,
+                vectors_config=vectors_config
+            )
 
 st.markdown("""
 <style>
@@ -574,85 +583,24 @@ div[data-baseweb="tab-list"] {
     padding-top: 7rem;
 }
 
-/* Tab background colors + black bold text */
-div[data-baseweb="tab-list"] [role="tab"]:nth-of-type(1) {
-    background-color: #d9f2d9;  
+/* All tabs same blue background + bold black text + border */
+div[data-baseweb="tab-list"] [role="tab"] {
+    background-color: #cce5ff !important;  
     color: black !important;
-    font-weight: bold;
-    border-radius: 14px 14px 0 0;
+    font-weight: bold !important;
+    border-radius: 8px 8px 0 0;
+    border: 1px solid #888;  /* Normal tabs border */
     padding: 0.5rem 1rem;
-    margin-right: 54px;
+    margin-right: 5px;  /* Slight gap between tabs for borders */
     position: relative;
 }
 
-/* Add right arrow separator 20px away from App tab */
-div[data-baseweb="tab-list"] [role="tab"]:nth-of-type(1)::after {
-    content: "";
-    position: absolute;
-    right: -25px;
-    top: 30%;
-    width: 0;
-    height: 0;
-    border-top: 8px solid transparent;
-    border-bottom: 8px solid transparent;
-    border-right: 10px solid #888;
-    filter: drop-shadow(0px 0px 3px rgba(0,0,0,0.4));
-}
-
-div[data-baseweb="tab-list"] [role="tab"]:nth-of-type(2) {
-    background-color: #cce5ff;  
-    color: black !important;
-    font-weight: bold;
-    border-radius: 8px 8px 0 0;
-    padding: 0.5rem 1rem;
-    margin-right: 0px;
-}
-div[data-baseweb="tab-list"] [role="tab"]:nth-of-type(3) {
-    background-color: #ffe5cc;  
-    color: black !important;
-    font-weight: bold;
-    border-radius: 8px 8px 0 0;
-    padding: 0.5rem 1rem;
-    margin-right: 0px;
-}
-div[data-baseweb="tab-list"] [role="tab"]:nth-of-type(4) {
-    background-color: #d4edda;  
-    color: black !important;
-    font-weight: bold;
-    border-radius: 8px 8px 0 0;
-    padding: 0.5rem 1rem;
-    margin-right: 0px;
-}
-div[data-baseweb="tab-list"] [role="tab"]:nth-of-type(5) {
-    background-color: #f8d7da;  
-    color: black !important;
-    font-weight: bold;
-    border-radius: 8px 8px 0 0;
-    padding: 0.5rem 1rem;
-    margin-right: 0px;
-}
-div[data-baseweb="tab-list"] [role="tab"]:nth-of-type(6) {
-    background-color: #e6e0f8;  
-    color: black !important;
-    font-weight: bold;
-    border-radius: 8px 8px 0 0;
-    padding: 0.5rem 1rem;
-    margin-right: 0px;
-}
-div[data-baseweb="tab-list"] [role="tab"]:nth-of-type(7) {
-    background-color: #ccf2f4;  
-    color: black !important;
-    font-weight: bold;
-    border-radius: 8px 8px 0 0;
-    padding: 0.5rem 1rem;
-    margin-right: 0px;
-}
-
-/* Selected tab with extremely deep shadow all around */
+/* Selected tab with deep shadow + darker border */
 div[data-baseweb="tab-list"] [role="tab"][aria-selected="true"] {
     color: black !important;
-    font-weight: bold;
+    font-weight: bold !important;
     box-shadow: 0 15px 35px rgba(0,0,0,0.8), 0 0 30px rgba(0,0,0,0.6);
+    border: 2px solid #111;  /* Much darker border for selected tab */
 }
 </style>
 """, unsafe_allow_html=True)
@@ -724,7 +672,7 @@ with about_tab:
             <div style="flex:1">
                 <h4 style="font-size:18px; font-weight:bold; color:#000000;">📘 How to Use the App</h4>
                 <ul style="font-size:15px; color:#000000;">
-                    <li>Upload PostgreSQL log files in the sidebar (.txt, .log, .csv, .pdf, .docx).</li>
+                    <li>Upload PostgreSQL log files in the sidebar (.txt, .log).</li>
                     <li>Click <b>Ingest & Index</b> (or enable auto-index) to process logs.</li>
                     <li>Search logs with keywords or paste log lines.</li>
                     <li>Filter results by severity or time range.</li>
@@ -804,50 +752,8 @@ with tab5:
     st.info("Only the logs you select will be ingested into Qdrant (optional)")
     only_lvls = st.multiselect("Filter Levels", ["ERROR", "WARNING", "FATAL", "PANIC"])
 
-# -------------------------
-# CSV to text -> temporary .txt file
-# -------------------------
-
-def csv_to_text_file(file):
-    """
-    Converts a CSV log file into properly formatted PostgreSQL log lines.
-    Ensures a space after the colon in log levels.
-    Writes the result to a temporary .txt file and returns its path.
-    """
-    log_lines = []
-
-    try:
-        file.seek(0)
-        reader = csv.reader(file.read().decode("utf-8").splitlines())
-        for row in reader:
-            line = " ".join(row)
-            if not re.match(r"\d{4}-\d{2}-\d{2}", line):
-                continue
-
-            # Normalize PID brackets
-            line = re.sub(r"(CEST )(\d+)(\s+)", r"\1[\2]\3", line)
-
-            # Ensure log levels have colon AND extra space after it
-            line = re.sub(r"\b(LOG|FATAL|ERROR|WARNING|NOTICE|INFO)\b(?!:)", r"\1: ", line)
-
-            log_lines.append(line.strip())
-
-    except Exception as e:
-        st.error(f"Failed to process CSV '{file.name}': {e}")
-        return None
-
-    if not log_lines:
-        st.warning(f"No valid log lines found in '{file.name}'")
-        return None
-
-    # Write to temporary .txt file
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w", encoding="utf-8")
-    tmp.write("\n".join(log_lines))
-    tmp.close()
-    return tmp.name
-
 def load_uploaded_file(uploaded_file):
-    """Load .txt, .log, .csv, .pdf, .docx files and return text content."""
+    """Load .txt, .log files and return text content."""
     suffix = os.path.splitext(uploaded_file.name)[-1].lower()
     text = ""
 
@@ -858,33 +764,11 @@ def load_uploaded_file(uploaded_file):
     if suffix in {".txt", ".log"}:
         with open(tmp_path, "r", encoding="utf-8", errors="ignore") as f:
             text = f.read()
-    elif suffix == ".csv":
-        try:
-            df = pd.read_csv(tmp_path)
-            text = df.to_string(index=False)
-        except Exception as e:
-            st.error(f"CSV parsing error: {e}")
-            return ""
-    elif suffix == ".pdf":
-        try:
-            import pypdf
-            reader = pypdf.PdfReader(tmp_path)
-            text = "\n".join(page.extract_text() or "" for page in reader.pages)
-        except Exception:
-            st.error("PDF parsing requires 'pypdf'.")
-            return ""
-    elif suffix == ".docx":
-        try:
-            import docx2txt
-            text = docx2txt.process(tmp_path)
-        except Exception:
-            st.error("DOCX parsing requires 'docx2txt'.")
-            return ""
     else:
-        st.error("Unsupported file format. Use .txt/.log/.csv/.pdf/.docx")
+        st.error("Unsupported file format. Use .txt/.log")
         return ""
 
-    # Clean up temporary file
+    # Clean up uploaded tmp
     try:
         os.remove(tmp_path)
     except Exception:
@@ -924,7 +808,7 @@ if "uploaded_data" not in st.session_state:
 
 uploaded_files = st.sidebar.file_uploader(
     "📁 Upload log files",
-    type=["txt", "log", "pdf", "docx", "csv"],
+    type=["txt", "log"],
     accept_multiple_files=True
 )
 
@@ -1163,78 +1047,119 @@ def expand_context_around_hit(hit, window_seconds=3600):
     out = sorted(out, key=lambda p: (p.payload.get("ts", 0), p.payload.get("pid") or 0))
     return out
 
+import re
+
+# Regex to find PIDs in DETAIL lines, e.g., "Process 25002 waits for ShareLock ... blocked by process 24891"
+DETAIL_PID_RE = re.compile(r'Process (\d+) waits .*?blocked by process (\d+)', re.IGNORECASE)
+
+def get_deadlock_hit_for_pid(hits, pid):
+    """
+    Return the first deadlock hit matching the given PID, 
+    or any PIDs involved in the DETAIL lines of a deadlock.
+    """
+    for h in hits or []:
+        pl = h.payload or {}
+        msg = pl.get("message", "")
+        hit_pid = pl.get("pid")
+
+        if not msg or not DEADLOCK_LINE_RE.search(msg):
+            continue
+
+        # First, check if the hit PID matches directly
+        if hit_pid == pid:
+            return h
+
+        # If not, check if the PID appears in the DETAIL lines of the deadlock
+        detail_lines = pl.get("detail", "")
+        for m in DETAIL_PID_RE.finditer(detail_lines):
+            p1, p2 = int(m.group(1)), int(m.group(2))
+            if pid in (p1, p2):
+                return h
+
+    return None
+
 # -------------------------
-# Deadlock helpers (NEW)
+## -------------------------
+# Deadlock helpers (REPLACEMENT)
 # -------------------------
+# Regex to detect "deadlock detected"
 DEADLOCK_LINE_RE = re.compile(r'\bdeadlock detected\b', re.I)
+
+# Regex to extract waiters/blockers from DETAIL
 DEADLOCK_DETAIL_PAIR_RE = re.compile(
     r'Process\s+(?P<waiter>\d+)\s+waits.*?transaction\s+(?P<txid>\d+);.*?blocked by process\s+(?P<blocker>\d+)',
     re.I
 )
 
 def extract_deadlock_participants(payload_detail: str) -> dict:
-    """Return {'pairs': [(waiter_pid, blocker_pid, txid), ...], 'pids': {pid1, pid2}}."""
+    """Return dict with pairs of (waiter, blocker, txid) and unique PIDs."""
     pairs = []
     pids = set()
-    if not payload_detail:
-        return {"pairs": [], "pids": set()}
-    for m in DEADLOCK_DETAIL_PAIR_RE.finditer(payload_detail):
-        w = int(m.group('waiter')); b = int(m.group('blocker')); txid = int(m.group('txid'))
-        pairs.append((w, b, txid))
-        pids.add(w); pids.add(b)
+    if payload_detail:
+        for m in DEADLOCK_DETAIL_PAIR_RE.finditer(payload_detail):
+            w = int(m.group('waiter'))
+            b = int(m.group('blocker'))
+            txid = int(m.group('txid'))
+            pairs.append((w, b, txid))
+            pids.update([w, b])
     return {"pairs": pairs, "pids": pids}
 
-def get_deadlock_hits_from_search(hits):
-    """Pick the first hit whose message contains 'deadlock detected' (case-insensitive)."""
-    for h in hits or []:
-        msg = (h.payload or {}).get("message", "") or ""
-        if DEADLOCK_LINE_RE.search(msg):
-            return h
+def extract_pid_from_query(query: str):
+    """
+    Extract the first PID mentioned within square brackets [] in the query.
+    Returns the PID as an integer, or None if not found.
+    """
+    m = re.search(r'\[(\d+)\]', query)
+    if m:
+        return int(m.group(1))
     return None
 
 def fetch_pid_window(ts_center: int, pids: set[int], window_seconds: int = 120):
-    """Fetch events around ts for the given PIDs. We scroll by time and filter PIDs locally."""
+    """Fetch events around ts_center for given PIDs, sorted by timestamp."""
     if not pids:
         return []
-    flt = Filter(must=[FieldCondition(key="ts", range=Range(gte=ts_center-window_seconds, lte=ts_center+window_seconds))])
+    flt = Filter(must=[FieldCondition(key="ts", range=Range(
+        gte=ts_center - window_seconds,
+        lte=ts_center + window_seconds
+    ))])
     out, next_page = client.scroll(COLLECTION, limit=2000, with_payload=True, with_vectors=False, scroll_filter=flt)
     all_pts = list(out)
     while next_page:
-        out, next_page = client.scroll(COLLECTION, limit=2000, with_payload=True, with_vectors=False, scroll_filter=flt, offset=next_page)
+        out, next_page = client.scroll(COLLECTION, limit=2000, with_payload=True, with_vectors=False,
+                                       scroll_filter=flt, offset=next_page)
         all_pts.extend(out)
-    # keep only our PIDs
+    # Filter by PIDs
     all_pts = [p for p in all_pts if (p.payload or {}).get("pid") in pids]
     all_pts.sort(key=lambda p: (p.payload.get("ts", 0), p.payload.get("pid") or 0))
     return all_pts
 
 def find_last_statement_before(ts_center: int, points_for_pid: list):
-    """Return the last statement text at or before ts_center from a PID's points."""
-    last_stmt = None
-    last_stmt_ts = None
+    """Return the last SQL statement at or before ts_center."""
+    last_stmt, last_stmt_ts = None, None
     for p in points_for_pid:
         ts = p.payload.get("ts", 0)
         if ts > ts_center:
             break
         stmt = p.payload.get("statement")
         if stmt:
-            last_stmt = stmt
-            last_stmt_ts = ts
+            last_stmt, last_stmt_ts = stmt, ts
         else:
             ft = (p.payload or {}).get("full_text", "")
             m = re.search(r'\bSTATEMENT:\s+(.*)$', ft, re.I | re.M)
             if m:
-                last_stmt = m.group(1).strip()
-                last_stmt_ts = ts
+                last_stmt, last_stmt_ts = m.group(1).strip(), ts
     return last_stmt_ts, last_stmt
 
 def render_deadlock_report(deadlock_hit, context_points):
-    """Print a crisp, non-LLM report with exact SQLs."""
+    """Render deadlock report with full text, context, last statements, wait cycles, and fixes."""
+    if not deadlock_hit:
+        return
+
     pl = deadlock_hit.payload or {}
-    ts = pl.get("ts"); ts_str = pl.get("ts_str")
+    ts = pl.get("ts")
     detail = pl.get("detail", "") or ""
     parts = extract_deadlock_participants(detail)
-    pids = parts["pids"]
-    pairs = parts["pairs"]
+    pids, pairs = parts["pids"], parts["pairs"]
 
     st.markdown("## 🔒 Deadlock detected")
     st.code(pl.get("full_text", "")[:2000], language="text")
@@ -1242,7 +1167,7 @@ def render_deadlock_report(deadlock_hit, context_points):
         st.write("**DETAIL:**")
         st.code(detail[:2000], language="text")
 
-    # Split context by PID
+    # Context logs by PID
     by_pid = defaultdict(list)
     for p in context_points:
         by_pid[p.payload.get("pid")].append(p)
@@ -1253,6 +1178,7 @@ def render_deadlock_report(deadlock_hit, context_points):
         for r in rows:
             st.text(r.payload.get("full_text", "")[:2000])
 
+    # Last statements for each PID
     st.markdown("### 🧾 Involved SQL (last before deadlock)")
     for pid in sorted(by_pid.keys()):
         ts_stmt, stmt = find_last_statement_before(ts, by_pid[pid])
@@ -1263,16 +1189,22 @@ def render_deadlock_report(deadlock_hit, context_points):
         else:
             st.markdown(f"**PID {pid}** — *(no statement found in window; raise logging level or widen window)*")
 
+    # Wait cycle
     if pairs:
         st.markdown("### 🔁 Wait cycle")
-        for (w,b,txid) in pairs:
+        for w, b, txid in pairs:
             st.write(f"- Process **{w}** waits on **txid {txid}**, blocked by **{b}**")
 
+    # Suggested fixes
     st.markdown("### ✅ Targeted fixes")
-    st.write("- Ensure consistent lock ordering across code paths touching the same rows/tables.")
-    st.write("- Keep transactions short; avoid `pg_sleep` within transactions.")
-    st.write("- If FKs are involved, index all referencing columns to reduce lock scope.")
-    st.write("- Add retry-on-deadlock with jitter to the affected statements only.")
+    fixes = [
+        "Ensure consistent lock ordering across code paths touching the same rows/tables.",
+        "Keep transactions short; avoid `pg_sleep` within transactions.",
+        "If FKs are involved, index all referencing columns to reduce lock scope.",
+        "Add retry-on-deadlock with jitter to the affected statements only."
+    ]
+    for fix in fixes:
+        st.write(f"- {fix}")
 
 with app_tab:
     st.markdown('<div id="top"></div>', unsafe_allow_html=True)
@@ -1287,9 +1219,9 @@ with app_tab:
     ">
         <a href="#top" 
         style="
-            background-color:#ff6b6b;  
-            color:white;
-            font-weight:bold;
+            background-color:#cce5ff;
+            color:black;
+            font-weight:normal;
             text-decoration:none;
             padding:12px 18px;
             border-radius:12px;
@@ -1303,19 +1235,15 @@ with app_tab:
     """, unsafe_allow_html=True)
 
     # ------------------- Initialize session state -------------------
-    if "uploaded_data" not in st.session_state:
-        st.session_state.uploaded_data = {}
-    if "upload_sig" not in st.session_state:
-        st.session_state.upload_sig = None
-    if "first_upload_done" not in st.session_state:
-        st.session_state.first_upload_done = False
-    if "index_ready" not in st.session_state:
-        st.session_state.index_ready = False
+    for key in ["uploaded_data", "upload_sig", "first_upload_done", "index_ready"]:
+        if key not in st.session_state:
+            st.session_state[key] = {} if key=="uploaded_data" else None if key=="upload_sig" else False
 
     def compute_upload_signature(files):
-        if not files:
-            return None
-        return tuple((f.name, getattr(f, "size", None)) for f in files)
+        return tuple((f.name, getattr(f, "size", None)) for f in files) if files else None
+
+    # ------------------- Ensure table exists at app start -------------------
+    ensure_table_exists()
 
     # ------------------- File uploader UI -------------------
     if uploaded_files:
@@ -1344,32 +1272,31 @@ with app_tab:
                 ">{file_data['content'][:1000000]}</div>
                 """, unsafe_allow_html=True)
 
-            if uf.name.lower().endswith(".csv"):
-                try:
-                    df = pd.read_csv(uf)
-                    st.dataframe(df)
-                except Exception:
-                    st.warning(f"Could not read CSV: {uf.name}")
-
     # ------------------- Detect file changes -------------------
     current_sig = compute_upload_signature(uploaded_files)
-    files_changed = (uploaded_files and current_sig != st.session_state.upload_sig)
+    files_changed = current_sig != st.session_state.upload_sig
 
     # ------------------- Ingest & Index controls -------------------
     col_btn1, col_btn2 = st.sidebar.columns(2)
     with col_btn1:
-        ingest_click = st.button("Ingest & Index", type="primary")
+        ingest_click = st.button("Ingest & Index")
     with col_btn2:
         auto_index_new = st.checkbox("Auto-index on change", value=True)
 
     # ------------------- Determine whether to index -------------------
     should_index_now = False
-    if uploaded_files:
-        if not st.session_state.first_upload_done:
-            should_index_now = True
-        elif auto_index_new and files_changed:
+    first_upload = not st.session_state.get("first_upload_done", False)
+
+    # Check if DB or Qdrant collection is empty
+    db_empty = len(load_events_from_db()) == 0
+    qdrant_empty = not qdrant_index_exists()
+
+    if st.session_state.uploaded_data:
+        if first_upload or ingest_click or (auto_index_new and files_changed) or db_empty or qdrant_empty:
             should_index_now = True
         elif ingest_click:
+            should_index_now = True
+        elif auto_index_new and files_changed:
             should_index_now = True
 
     # ------------------- Ingest -------------------
@@ -1378,7 +1305,7 @@ with app_tab:
         ensure_table_exists()
         for uf in uploaded_files:
             file_key = f"{uf.name}_{get_file_hash(uf)}"
-            text = st.session_state.uploaded_data[file_key]["content"]
+            text = st.session_state.uploaded_data.get(file_key, {}).get("content", "")
             if not text:
                 continue
             st.info(f"Parsing: {uf.name}")
@@ -1387,19 +1314,9 @@ with app_tab:
             st.success(f"Inserted {inserted} events from {uf.name}.")
             all_events.extend(events)
 
-        # Update session state after successful ingestion
-        st.session_state.upload_sig = current_sig
-        st.session_state.first_upload_done = True
-        st.session_state.index_ready = True
+    # Create SQLAlchemy engine
+    engine = create_engine("postgresql+psycopg2://postgres:accesspass@localhost:5433/tsdb")
 
-    # ------------------- PostgreSQL severity chart -------------------
-    conn = psycopg2.connect(
-        host="localhost",
-        port="5433",
-        dbname="tsdb",
-        user="postgres",
-        password="accesspass"
-    )
     severity_query = """
     SELECT level AS severity, COUNT(*) AS count
     FROM uploaded_logs
@@ -1417,10 +1334,12 @@ with app_tab:
         ELSE 9
     END
     """
-    logs_df = pd.read_sql(severity_query, conn)
-    conn.close()
+    try:
+        logs_df = pd.read_sql(severity_query, engine)
+    except Exception:
+        logs_df = pd.DataFrame(columns=["severity", "count"])
 
-    severity_order = ["PANIC", "FATAL", "ERROR", "WARNING", "NOTICE", "INFO", "LOG", "DEBUG"]
+    severity_order = ["PANIC","FATAL","ERROR","WARNING","NOTICE","INFO","LOG","DEBUG"]
     logs_df = logs_df.set_index('severity').reindex(severity_order, fill_value=0).reset_index()
 
     col1, col2 = st.columns([2,1])
@@ -1428,16 +1347,19 @@ with app_tab:
         SHOW_ZERO_COUNTS = st.checkbox("Show severities with 0 count", value=True)
 
     display_df = logs_df[logs_df['count']>0] if not SHOW_ZERO_COUNTS else logs_df.copy()
-    total_row = pd.DataFrame([{'severity': 'TOTAL', 'count': display_df['count'].sum()}])
-    logs_df_total = pd.concat([display_df, total_row], ignore_index=True)
+    total_row = pd.DataFrame([{'severity':'TOTAL','count':display_df['count'].sum()}])
+    logs_df_total = pd.concat([display_df,total_row],ignore_index=True)
 
     def highlight_total(row):
-        return ['font-weight: bold']*len(row) if row['severity']=='TOTAL' else ['']*len(row)
+        return ['font-weight:bold']*len(row) if row['severity']=='TOTAL' else ['']*len(row)
 
     styled_logs_df = logs_df_total.style.apply(highlight_total, axis=1)
 
+    # ------------------- Blue gradient for severity -------------------
+    blue_colors = ["#3366cc","#4d79e6","#6699ff","#85adff","#a3c2ff","#c2d6ff","#e0ebff","#f2f9ff"]
+    color_map = dict(zip(severity_order, blue_colors))
+
     with col1:
-        colors_reversed = px.colors.sequential.YlOrRd[::-1]
         fig = px.bar(
             display_df,
             x='severity',
@@ -1445,13 +1367,17 @@ with app_tab:
             text='count',
             title='PostgreSQL Log Severity Counts',
             color='severity',
-            color_discrete_sequence=colors_reversed
+            color_discrete_map=color_map
         )
-        fig.update_traces(textposition='outside', hovertemplate='Severity: %{x}<br>Count: %{y}')
-        st.plotly_chart(fig, use_container_width=True)
+        fig.update_traces(
+            textposition='outside',
+            hovertemplate='Severity: %{x}<br>Count: %{y}',
+            textfont_color='white'
+        )
+        st.plotly_chart(fig, width="stretch")
 
     with col2:
-        st.dataframe(styled_logs_df.hide(axis="columns"), use_container_width=True)
+        st.dataframe(styled_logs_df.hide(axis="columns"), width="stretch")
 
     st.divider()
 
@@ -1502,6 +1428,7 @@ with app_tab:
     # -------------------------
     # Search Button
     # -------------------------
+    # Search Button
     if st.button("Search"):
         if not q:
             st.warning("Enter a query.")
@@ -1529,29 +1456,127 @@ with app_tab:
                 # -------------------------
                 # Search Results in Expander
                 # -------------------------
-                with st.expander("📑 Search Results (expand/collapse)", expanded=True):
-                    deadlock_hit = get_deadlock_hits_from_search(hits)
+                # -------------------------
+                with st.expander("📑 Top Matches and Context", expanded=True):
+                    all_logs_for_rerank = []
+                    hits_to_process = []
+                    # Check if the query mentions deadlock
+                    if "deadlock detected" in q.lower():
+                        query_pid = extract_pid_from_query(q)
+                        deadlock_hit = get_deadlock_hit_for_pid(hits, query_pid)
+                        st.session_state["deadlock_hit"] = deadlock_hit
 
-                    if deadlock_hit:
-                        dl_ts = (deadlock_hit.payload or {}).get("ts")
-                        detail = (deadlock_hit.payload or {}).get("detail", "") or ""
-                        parts = extract_deadlock_participants(detail)
-                        pids = parts["pids"]
-                        ctx = fetch_pid_window(dl_ts, pids, window_seconds=120)
-                        render_deadlock_report(deadlock_hit, ctx)
+                        if deadlock_hit:
+                            pl = deadlock_hit.payload or {}
+                            dl_ts = pl.get("ts")
+                            detail = pl.get("detail", "") or ""
+                            parts = extract_deadlock_participants(detail)
+                            pids = parts["pids"]
+                            pairs = parts["pairs"]
+
+                            # Fetch ±120s context for display
+                            ctx = fetch_pid_window(dl_ts, pids, window_seconds=120)
+                            render_deadlock_report(deadlock_hit, ctx)
+
+                            # Prepare info for LLM
+                            last_statements = []
+                            for pid in sorted(pids):
+                                ts_stmt, stmt = find_last_statement_before(dl_ts, [p for p in ctx if p.payload.get("pid") == pid])
+                                if stmt:
+                                    when = datetime.utcfromtimestamp(ts_stmt).strftime("%Y-%m-%d %H:%M:%S UTC") if ts_stmt else "(unknown)"
+                                    last_statements.append(f"PID {pid} — last statement @ {when}\n{stmt}")
+
+                            wait_cycle_text = "\n".join([f"Process {w} waits on txid {txid}, blocked by {b}" for w, b, txid in pairs])
+                            targeted_fixes = "\n".join([
+                                "Ensure consistent lock ordering across code paths touching the same rows/tables.",
+                                "Keep transactions short; avoid `pg_sleep` within transactions.",
+                                "If FKs are involved, index all referencing columns to reduce lock scope.",
+                                "Add retry-on-deadlock with jitter to the affected statements only."
+                            ])
+                            last_sql_text = "\n".join(last_statements)
+
+                            st.session_state.reranked_logs = [
+                                "\n\n".join([
+                                    f"Deadlock message:\n{pl.get('full_text','')}",
+                                    f"DETAIL:\n{detail}",
+                                    f"Last SQL statements:\n{last_sql_text}",
+                                    f"Wait cycle:\n{wait_cycle_text}",
+                                    f"Targeted fixes:\n{targeted_fixes}"
+                                ])
+                            ]
+                        else:
+                            # Fallback to non-deadlock processing
+                            hits_to_process = hits[:5]
                     else:
-                        top = hits[0]
-                        ctx = expand_context_around_hit(top, window_seconds=3600)
+                        # Non-deadlock query
+                        hits_to_process = hits[:5]
 
-                        st.markdown("### 🎯 Top Match")
-                        st.code(top.payload.get("full_text", ""), language="text")
+                    # -------------------------
+                    # Non-deadlock: show top hits & context, prepare for rerank
+                    # -------------------------
+                    if hits_to_process:
+                        st.markdown("### 🎯 Top Matches")
+                        window_sec = 1800
+                        window_str = "±30 minutes"
+                        all_context_logs = []
+                        all_logs_for_rerank = []  # reset
 
-                        st.markdown("### 🧭 Context (±60 minutes)")
-                        for p in ctx:
-                            st.text(p.payload.get("full_text", "")[:2000])
+                        for i, hit in enumerate(hits_to_process, start=1):
+                            st.markdown(f"#### #{i}")
+                            hit_text = hit.payload.get("full_text", "")
+                            st.code(hit_text, language="text")
 
-                # Update expander state in session
-                st.session_state.expander_open = False  # Assume user read it if search finished
+                            # ✅ Always include the original semantic hit itself
+                            all_context_logs.append({
+                                "ts": hit.payload.get("ts"),
+                                "message": hit.payload.get("message"),
+                                "full_text": hit_text
+                            })
+
+                            # Expand context around hit
+                            ctx = expand_context_around_hit(hit, window_seconds=window_sec)
+                            for p in ctx:
+                                ts = p.payload.get("ts")
+                                msg = p.payload.get("message")
+                                log_text = p.payload.get("full_text", "")
+                                all_context_logs.append({"ts": ts, "message": msg, "full_text": log_text})
+
+                        # Deduplicate (by timestamp + message)
+                        unique_context = []
+                        seen_keys = set()
+                        for log in all_context_logs:
+                            key = (log["ts"], log["message"])
+                            if key not in seen_keys:
+                                unique_context.append(log)
+                                seen_keys.add(key)
+
+                        # Display logs & prepare rerank set
+                        st.markdown(f"**Context ({window_str} + top hits)**")
+                        for log in unique_context:
+                            st.text(log["full_text"][:2000])
+                            all_logs_for_rerank.append(log["full_text"])
+
+                        # -------------------------
+                        # Rerank logs for summarization
+                        # -------------------------
+                        if all_logs_for_rerank:
+                            from sklearn.metrics.pairwise import cosine_similarity
+                            import numpy as np
+
+                            seen = set()
+                            unique_logs = []
+                            for log_text in all_logs_for_rerank:
+                                if log_text not in seen:
+                                    seen.add(log_text)
+                                    unique_logs.append(log_text)
+
+                            log_vecs = embed_texts(unique_logs)
+                            q_vec = embed_texts([q])[0].reshape(1, -1)
+                            sims = cosine_similarity(q_vec, log_vecs)[0]
+                            top_idx = np.argsort(sims)[::-1][:20]
+                            st.session_state.reranked_logs = [unique_logs[i] for i in top_idx]
+
+                    st.session_state.expander_open = False
 
     # -------------------------
     # Placeholder for Summary Section
@@ -1572,9 +1597,8 @@ with app_tab:
             <a href="#summary_section" 
             onclick="window.parent.postMessage({{'show_summary': true}}, '*');"
             style="
-                    background-color:#ff6b6b;  /* light red */
-                    color:white;
-                    font-weight:bold;            /* bold letters */
+                    background-color:#cce5ff;
+                    color:black;
                     text-decoration:none;
                     padding:12px 18px;
                     border-radius:12px;
@@ -1587,12 +1611,12 @@ with app_tab:
         """, unsafe_allow_html=True)
 
     st.markdown('<div id="top"></div>', unsafe_allow_html=True)
-   
+
     # -------------------------
-    # Listen for floating button click via query param (hack)
+    # Summary Button
     # -------------------------
-    # Streamlit cannot directly capture JS postMessage, so we simulate by user clicking the anchor
-    # For simplicity, let's show summary button if expander is closed or search completed
+    # Summary Button
+    # -------------------------
     if st.session_state.last_hits and (not st.session_state.expander_open or st.session_state.show_summary_button):
         if st.button("✨ Generate Summary", key="summary_button"):
             if not OPENAI_API_KEY:
@@ -1600,30 +1624,61 @@ with app_tab:
             else:
                 with st.spinner("Summarizing with OpenAI..."):
                     try:
-                        summary_chunks = [
-                            h.payload.get("full_text", "")[:1500]
-                            for h in st.session_state.last_hits[:5]
-                        ]
-                        corpus = "\n\n---\n\n".join(summary_chunks) if summary_chunks else "(no relevant context found)"
+                        if "reranked_logs" not in st.session_state or not st.session_state.reranked_logs:
+                            st.warning("No logs available for summarization. Perform a search first.")
+                        else:
+                            # Deduplicate logs (keep first occurrence)
+                            seen = set()
+                            unique_logs = []
+                            for log in st.session_state.reranked_logs:
+                                if log not in seen:
+                                    unique_logs.append(log)
+                                    seen.add(log)
 
-                        system_prompt = (
-                            "You are a PostgreSQL SRE. "
-                            "Given PostgreSQL logs, produce a concise root-cause explanation and actionable steps."
-                        )
-                        user_prompt = (
-                            f"Query:\n{q}\n\n"
-                            f"Relevant logs:\n{corpus}\n\n"
-                            "Return: Root Cause, Evidence (with timestamps), and 3 actionable fixes."
-                        )
+                            # Truncate logs to 1500 chars for summarization
+                            summary_logs = [log[:2000] for log in unique_logs]
 
-                        content = call_openai_chat([
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt}
-                        ])
+                            # Concatenate for LLM
+                            corpus = "\n\n---\n\n".join(summary_logs[:20])  # only top 20 unique logs
 
-                        st.subheader("✅ Root Cause Summary")
-                        st.markdown(content)
+                            # Show what is being sent (view-only)
+                            st.markdown(
+                                f"""
+                                <textarea readonly style="
+                                    width: 100%;
+                                    height: 300px;
+                                    background-color: white;
+                                    color: black;
+                                    border: 1px solid #ddd;
+                                    padding: 10px;
+                                    font-family: monospace;
+                                    font-size: 14px;
+                                    overflow:auto;
+                                    resize: none;
+                                ">{corpus}</textarea>
+                                """,
+                                unsafe_allow_html=True
+                            )
+
+                            system_prompt = (
+                                "You are a PostgreSQL SRE. "
+                                "Given PostgreSQL logs, produce a concise root-cause explanation and actionable steps."
+                            )
+                            user_prompt = (
+                                f"User Query:\n{q}\n\n"
+                                f"Relevant logs (or deadlock info):\n{corpus}\n\n"
+                                "Instructions: Analyze the logs strictly in the context of the user's query above. "
+                                "Provide a concise root-cause explanation, evidence with timestamps, and 3 actionable fixes "
+                                "that directly address the query. Do not include irrelevant information."
+                            )
+
+                            content = call_openai_chat([
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_prompt}
+                            ])
+
+                            st.subheader("✅ Root Cause Summary")
+                            st.markdown(content)
 
                     except Exception as e:
                         st.error(f"LLM summarization failed: {e}")
-
