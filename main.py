@@ -1407,53 +1407,6 @@ with app_tab:
         ingest_click = st.button("Ingest & Index")
     with col_btn2:
         auto_index_new = st.checkbox("Auto-index on change", value=True)
-    
-
-    import streamlit as st
-
-    # ------------------- LLM Backends -------------------
-    LLM_BACKENDS = [
-        "OpenAI",
-        "Google Gemini",
-        "Claude",
-        "Perplexity",
-        "Deep Seek",
-        "Grok",
-        "Meta"
-    ]
-
-    # ------------------- Sidebar: Backend selection -------------------
-    selected_backend = st.sidebar.selectbox("Select LLM backend", LLM_BACKENDS)
-
-    # ------------------- Sidebar: User types model name -------------------
-    typed_model = st.sidebar.text_input(f"Enter {selected_backend} model name")
-
-    # ------------------- Sidebar: API Key / Password -------------------
-    typed_password = st.sidebar.text_input(f"Enter {selected_backend} API key / password", type="password")
-
-    # ------------------- Validation -------------------
-    model_ready = typed_model.strip() != ""
-    password_ready = typed_password.strip() != ""
-
-    if not model_ready:
-        st.sidebar.warning("Please enter a model name to proceed.")
-    if not password_ready:
-        st.sidebar.warning("Please enter the API key / password to proceed.")
-
-    # ------------------- Example: Using selection in main app -------------------
-    if st.button("Show LLM choice"):
-        if model_ready and password_ready:
-            st.write(f"Backend: {selected_backend}")
-            st.write(f"Model: {typed_model}")
-            st.write(f"API key provided ✅")
-        else:
-            st.warning("Enter both model name and API key first.")
-
-    # ------------------- Integration hint for summary section -------------------
-    # Later, in your Generate Summary logic:
-    # llm_response = call_llm(selected_backend, typed_model, typed_password, prompts)
-
-
 
     # ------------------- Determine whether to index -------------------
     should_index_now = False
@@ -1602,18 +1555,16 @@ with app_tab:
     # -------------------------
     QUERY_CACHE_COLLECTION = "query_cache"
     VECTOR_NAME = "query_vec"
-    EMBEDDING_DIM = 1536 # your LLM embedding size
+    EMBEDDING_DIM = 1536  # your LLM embedding size
 
     # -------------------------
-    # Connect to Qdrant (using Streamlit Caching)
+    # Connect to Qdrant
     # -------------------------
-    
     # ⚠️ Use @st.cache_resource to ensure this initialization runs only ONCE.
     @st.cache_resource
     def init_qdrant_cache_client():
         """Initializes the Qdrant client and ensures the query_cache collection exists with correct config."""
-        
-        client = QdrantClient(url="http://localhost:6333")
+        client = QdrantClient(url=f"http://localhost:6333")
         
         REQUIRED_VECTORS_CONFIG = {
             VECTOR_NAME: VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE)
@@ -1664,7 +1615,7 @@ with app_tab:
     # This line runs once on startup and retrieves the cached client on subsequent runs.
     # -------------------------
     client = init_qdrant_cache_client()
-  
+
     # -------------------------
     # Helpers
     # -------------------------
@@ -1840,6 +1791,9 @@ with app_tab:
                         # Rerank logs for LLM
                         # -------------------------
                         if all_logs_for_rerank:
+                            from sklearn.metrics.pairwise import cosine_similarity
+                            import numpy as np
+
                             seen = set()
                             unique_logs = []
                             for log_text in all_logs_for_rerank:
@@ -1850,37 +1804,22 @@ with app_tab:
                             log_vecs = embed_texts(unique_logs)
                             q_vec = embed_texts([q])[0].reshape(1, -1)
                             sims = cosine_similarity(q_vec, log_vecs)[0]
-                            top_idx = np.argsort(sims)[::-1][:1]
+                            top_idx = np.argsort(sims)[::-1][:20]
                             st.session_state.reranked_logs = [unique_logs[i] for i in top_idx]
 
                     st.session_state.expander_open = False
+
     # -------------------------
-    # Placeholder for Summary Section
+    # Summary Section & Button
     # -------------------------
     st.markdown('<div id="summary_section"></div>', unsafe_allow_html=True)
 
-    # -------------------------
-    # Floating "Go to Summary" Button
-    # -------------------------
     if st.session_state.get("last_hits"):
         st.markdown("""
-        <div style="
-            position: fixed; 
-            bottom: 30px; 
-            right: 30px; 
-            z-index: 9999;
-        ">
+        <div style="position: fixed; bottom: 30px; right: 30px; z-index: 9999;">
             <a href="#summary_section" 
             onclick="window.parent.postMessage({{'show_summary': true}}, '*');"
-            style="
-                    background-color:#cce5ff;
-                    color:black;
-                    text-decoration:none;
-                    padding:12px 18px;
-                    border-radius:12px;
-                    font-size:16px;
-                    box-shadow:0px 4px 8px rgba(0,0,0,0.2);
-                ">
+            style="background-color:#cce5ff; color:black; text-decoration:none; padding:12px 18px; border-radius:12px; font-size:16px; box-shadow:0px 4px 8px rgba(0,0,0,0.2);">
                 ✨ Go to Summary
             </a>
         </div>
@@ -1888,210 +1827,86 @@ with app_tab:
 
     st.markdown('<div id="top"></div>', unsafe_allow_html=True)
 
-    # -------------------------
-    # Summary Section & Button
-
-    def call_llm(backend, model_name, api_key, messages, max_tokens_per_request=2000):
-        """
-        Calls the selected LLM backend with validation and input truncation.
-
-        Args:
-            backend (str): LLM backend name (OpenAI, Gemini, Claude, etc.).
-            model_name (str): Model name provided by the user.
-            api_key (str): API key / password for authentication.
-            messages (list): List of dicts {"role": ..., "content": ...}.
-            max_tokens_per_request (int): Max tokens per single request to avoid large payloads.
-
-        Returns:
-            str: LLM-generated response text.
-        """
-        if not model_name.strip():
-            raise ValueError("Model name cannot be empty.")
-        if not api_key.strip():
-            raise ValueError("API key / password cannot be empty.")
-        if not messages or not all("role" in m and "content" in m for m in messages):
-            raise ValueError("Messages must be a list of dicts with 'role' and 'content'.")
-
-        # Truncate content
-        truncated_messages = []
-        for m in messages:
-            content = m["content"]
-            if len(content) > max_tokens_per_request:
-                content = content[:max_tokens_per_request] + "\n\n[TRUNCATED]"
-            truncated_messages.append({"role": m["role"], "content": content})
-
-        backend_lower = backend.lower()
-
-        # OpenAI / Gemini (OpenAI-compatible API)
-        if backend_lower in ["openai", "google gemini"]:
-            from openai import OpenAI
-            client = OpenAI(api_key=api_key)
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=truncated_messages,
-                temperature=0.2,
-                max_tokens=2000
-            )
-            return response.choices[0].message.content
-
-        # Claude
-        elif backend_lower == "claude":
-            url = "https://api.anthropic.com/v1/claude-3/messages"
-            headers = {"Authorization": f"Bearer {api_key}"}
-            data = {
-                "model": model_name,
-                "messages": truncated_messages,  # proper list
-                "temperature": 0.2,
-                "max_tokens_to_sample": 2000
-            }
-            resp = requests.post(url, headers=headers, json=data)
-            resp.raise_for_status()
-            return resp.json()["completion"]
-
-        # Perplexity
-        elif backend_lower == "perplexity":
-            url = "https://api.perplexity.ai/chat/completions"
-            headers = {"Authorization": f"Bearer {api_key}"}
-            data = {
-                "model": model_name,
-                "messages": truncated_messages,
-                "temperature": 0.2,
-                "max_tokens": 2000
-            }
-            resp = requests.post(url, headers=headers, json=data)
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
-
-        # Deep Seek
-        elif backend_lower == "deep seek":
-            url = "https://api.deepseek.com/v1/chat/completions"
-            headers = {"Authorization": f"Bearer {api_key}"}
-            data = {
-                "model": model_name,
-                "messages": truncated_messages,
-                "temperature": 0.2,
-                "max_tokens": 2000
-            }
-            resp = requests.post(url, headers=headers, json=data)
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
-
-        # Grok (xAI)
-        elif backend_lower == "grok":
-            url = "https://api.x.ai/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            }
-            data = {
-                "model": model_name,
-                "messages": truncated_messages,
-                "temperature": 0.2,
-                "max_tokens": 2000
-            }
-            resp = requests.post(url, headers=headers, json=data)
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
-
-        # Meta
-        elif backend_lower == "meta":
-            url = "https://api.meta.com/v1/chat/completions"
-            headers = {"Authorization": f"Bearer {api_key}"}
-            data = {
-                "model": model_name,
-                "messages": truncated_messages,
-                "temperature": 0.2,
-                "max_tokens": 2000
-            }
-            resp = requests.post(url, headers=headers, json=data)
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
-
-        else:
-            raise ValueError(f"Unsupported backend: {backend}")
-
-    # ------------------------- Generate Summary Section -------------------------
-    st.markdown('<div id="summary_section"></div>', unsafe_allow_html=True)
-
     if st.session_state.get("last_hits") and (not st.session_state.get("expander_open", False) or st.session_state.get("show_summary_button", False)):
         if st.button("✨ Generate Summary", key="summary_button"):
+            if not OPENAI_API_KEY:
+                st.error("OPENAI_API_KEY not set.")
+            else:
+                with st.spinner("Checking cache..."):
+                    try:
+                        # -------------------------
+                        # Embed the query
+                        # -------------------------
+                        q_vec = embed_texts([q])[0]
+                        q_vec_list = np.asarray(q_vec, dtype=float).flatten().tolist()
+                        print("🔹 Query embedding sample:", q_vec_list[:5])
 
-            # ------------------------- Validate model & password -------------------------
-            if not model_ready:
-                st.warning("Enter a valid LLM model name before generating summary.")
-                st.stop()
-            if not password_ready:
-                st.warning("Enter the API key / password before generating summary.")
-                st.stop()
+                        # -------------------------
+                        # Lookup in Qdrant cache
+                        # -------------------------
+                        cached_answer, cache_type = smart_cache_lookup(q_vec_list)
+                        print("✅ Cache lookup result:", cached_answer, cache_type)
 
-            with st.spinner("Checking cache..."):
-                try:
-                    # ------------------------- Embed the query -------------------------
-                    q_vec = embed_texts([q])[0]
-                    q_vec_list = np.asarray(q_vec, dtype=float).flatten().tolist()
-                    print("🔹 Query embedding sample:", q_vec_list[:5])
+                        if cached_answer:
+                            st.success(f"⚡ Served from cache ({cache_type})")
+                            st.subheader("✅ Root Cause Summary")
+                            st.markdown(cached_answer)
+                        else:
+                            # -------------------------
+                            # Check if reranked logs are available
+                            # -------------------------
+                            logs_to_summarize = st.session_state.get("reranked_logs", [])
+                            if not logs_to_summarize:
+                                st.warning("No logs available for summarization. Perform a search first.")
+                            else:
+                                # Deduplicate logs
+                                seen = set()
+                                unique_logs = []
+                                for log in logs_to_summarize:
+                                    if log not in seen:
+                                        seen.add(log)
+                                        unique_logs.append(log)
 
-                    # ------------------------- Lookup in Qdrant cache -------------------------
-                    cached_answer, cache_type = smart_cache_lookup(q_vec_list)
-                    print("✅ Cache lookup result:", cached_answer, cache_type)
+                                summary_logs = [log[:2000] for log in unique_logs]
+                                corpus = "\n\n---\n\n".join(summary_logs[:20])
 
-                    if cached_answer:
-                        st.success(f"⚡ Served from cache ({cache_type})")
-                        st.subheader("✅ Root Cause Summary")
-                        st.markdown(cached_answer)
-                    else:
-                        # ------------------------- Check reranked logs -------------------------
-                        logs_to_summarize = st.session_state.get("reranked_logs", [])
-                        if not logs_to_summarize:
-                            st.warning("No logs available for summarization. Perform a search first.")
-                            st.stop()
+                                # Display logs being sent
+                                st.markdown(f"""
+                                <textarea readonly style="width:100%; height:300px; background-color:white; color:black; border:1px solid #ddd; padding:10px; font-family:monospace; font-size:14px; overflow:auto; resize:none;">{corpus}</textarea>
+                                """, unsafe_allow_html=True)
 
-                        # Deduplicate logs
-                        seen = set()
-                        unique_logs = []
-                        for log in logs_to_summarize:
-                            if log not in seen:
-                                seen.add(log)
-                                unique_logs.append(log)
+                                # -------------------------
+                                # Call LLM
+                                # -------------------------
+                                system_prompt = (
+                                    "You are a PostgreSQL SRE. "
+                                    "Given PostgreSQL logs, produce a concise root-cause explanation and actionable steps."
+                                )
+                                user_prompt = (
+                                    f"User Query:\n{q}\n\n"
+                                    f"Relevant logs:\n{corpus}\n\n"
+                                    "Instructions: Analyze the logs strictly in the context of the user's query. "
+                                    "Provide a concise root-cause explanation, evidence with timestamps, "
+                                    "and 3 actionable fixes directly addressing the query."
+                                )
 
-                        summary_logs = [log[:2000] for log in unique_logs]
-                        corpus = "\n\n---\n\n".join(summary_logs[:1])
+                                print("📝 Sending prompts to LLM...")
+                                llm_response = call_openai_chat([
+                                    {"role": "system", "content": system_prompt},
+                                    {"role": "user", "content": user_prompt}
+                                ])
+                                print("✅ LLM response received")
 
-                        # Display logs being sent
-                        st.markdown(f"""
-                        <textarea readonly style="width:100%; height:300px; background-color:white; color:black; border:1px solid #ddd; padding:10px; font-family:monospace; font-size:14px; overflow:auto; resize:none;">{corpus}</textarea>
-                        """, unsafe_allow_html=True)
+                                st.subheader("✅ Root Cause Summary")
+                                st.markdown(llm_response)
 
-                        # ------------------------- Prepare prompts -------------------------
-                        system_prompt = (
-                            "You are a PostgreSQL SRE. "
-                            "Given PostgreSQL logs, produce a concise root-cause explanation and actionable steps."
-                        )
-                        user_prompt = (
-                            f"User Query:\n{q}\n\n"
-                            f"Relevant logs:\n{corpus}\n\n"
-                            "Instructions: Analyze the logs strictly in the context of the user's query. "
-                            "Provide a concise root-cause explanation, evidence with timestamps, "
-                            "and 3 actionable fixes directly addressing the query."
-                        )
+                                # -------------------------
+                                # Cache the answer in Qdrant
+                                # -------------------------
+                                cache_query_answer(q, q_vec_list, llm_response)
+                                print("✅ Cached successfully")
 
-                        # ------------------------- Call LLM dynamically -------------------------
-                        print(f"📝 Sending prompts to {selected_backend} (model: {typed_model})...")
-                        llm_response = call_llm(selected_backend, typed_model, typed_password, [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt}
-                        ])
-                        print("✅ LLM response received")
-
-                        # ------------------------- Display summary -------------------------
-                        st.subheader("✅ Root Cause Summary")
-                        st.markdown(llm_response)
-
-                        # ------------------------- Cache the answer -------------------------
-                        cache_query_answer(q, q_vec_list, llm_response)
-                        print("✅ Cached successfully")
-
-                except Exception as e:
-                    import traceback
-                    print("❌ Exception trace:", traceback.format_exc())
-                    st.error(f"LLM summarization failed: {e}")
+                    except Exception as e:
+                        import traceback
+                        print("❌ Exception trace:", traceback.format_exc())
+                        st.error(f"LLM summarization failed: {e}")
