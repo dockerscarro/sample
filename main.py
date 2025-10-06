@@ -29,6 +29,8 @@ from dateutil import parser as dtparser
 
 import pandas as pd
 import plotly.express as px
+import dateutil.parser as dtparser
+from sklearn.metrics.pairwise import cosine_similarity
 
 import numpy as np
 import psycopg2
@@ -36,7 +38,8 @@ import requests
 import streamlit as st
 import textwrap
 from sqlalchemy import create_engine
-
+from openai import OpenAI
+  
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import (
     Distance,
@@ -92,7 +95,6 @@ EMB_CACHE_PATH = "emb_cache.sqlite"  # persisted across runs
 
 # Qdrant
 COLLECTION = "pg_logs"
-CLUSTER_COLLECTION = "pg_log_clusters"
 
 QDRANT_URL = None
 QDRANT_HOST = "localhost"
@@ -108,6 +110,16 @@ QDRANT_RESET = False
 
 # Shard size
 SHARD_SIZE = 3000
+
+# --- ADD THIS BLOCK NEAR THE TOP OF YOUR SCRIPT ---
+# Initialize session state for Qdrant reset confirmation (ticked by default)
+if "qdrant_reset_confirmed" not in st.session_state:
+    st.session_state.qdrant_reset_confirmed = True
+
+# Initialize a dynamic key for the file uploader to enable resetting
+if 'file_uploader_key' not in st.session_state:
+    st.session_state.file_uploader_key = 0 
+# --------------------------------------------------
 
 # -------------------------
 # UTIL: Wait for Qdrant (HTTP ping)
@@ -126,6 +138,7 @@ def wait_for_qdrant(host: str, port: int, timeout: int = 30):
     raise RuntimeError("Qdrant not ready after waiting.")
 
 wait_for_qdrant(QDRANT_HOST, QDRANT_PORT)
+client = QdrantClient(url=f"http://{QDRANT_HOST}:{QDRANT_PORT}")
 
 # -------------------------
 # DB helpers & migration
@@ -694,6 +707,7 @@ with about_tab:
                     <li>Upload and preview logs (multi-format support).</li>
                     <li>Fast indexing with deduplication and caching.</li>
                     <li>Filter logs by severity (ERROR, WARNING, FATAL, PANIC).</li>
+                    <li>Reset Qdrant collection and also cache collection if needed.</li>
                     <li>Semantic search using embeddings (OpenAI/ST).</li>
                     <li>Deadlock detection and SQL reporting.</li>
                     <li>AI-based summaries (Root Cause + Fixes).</li>
@@ -717,14 +731,125 @@ with about_tab:
 with tab1:
     st.markdown('<div style="padding-top:3rem;"></div>', unsafe_allow_html=True)
     st.info("Runs a quick check to verify that your Qdrant database is running and functioning as expected")
+
     if st.button("Run Smoke Test"):
-        st.success("All good! Qdrant is up and running smoothly ✅")
+        with st.spinner("Running Qdrant smoke test (create->upsert->search->delete)..."):
+            try:
+                client_smoke = make_qdrant_client()
+                test_col = f"__smoke_test_{int(time.time())}_{random.randint(1000,9999)}"
+                # create minimal collection with a single named vector "v"
+                client_smoke.create_collection(
+                    collection_name=test_col,
+                    vectors_config={"v": VectorParams(size=1, distance=Distance.COSINE)}
+                )
+
+                pt_id = str(uuid.uuid4())
+                pt = PointStruct(id=pt_id, vector={"v":[0.123]}, payload={"ok": True})
+                client_smoke.upsert(collection_name=test_col, points=[pt], wait=True)
+
+                # search back the vector
+                results = client_smoke.search(collection_name=test_col, query_vector=("v", [0.123]), limit=1)
+                found = bool(results)
+
+                # cleanup
+                try:
+                    client_smoke.delete_collection(test_col)
+                except Exception:
+                    pass
+
+                if found:
+                    st.success("Smoke test passed — Qdrant accepted writes and returned expected results ✅")
+                else:
+                    st.error("Smoke test failed — write succeeded but search returned no results.")
+            except Exception as e:
+                st.error(f"Smoke test failed: {e}")
+                import traceback
+                st.text(traceback.format_exc())
 
 with tab2:
+    LOG_COLLECTION = "pg_logs"
+    CACHE_COLLECTION = "query_cache"
+    EMBEDDING_DIM = 1536 
+    
     st.markdown('<div style="padding-top:3rem;"></div>', unsafe_allow_html=True)
-    st.info("Clears all existing data and collections in Qdrant, restoring it to a fresh state")
-    if st.button("Reset Qdrant Collections"):
-        st.success("Qdrant reset successful! Your database is now fresh and empty ✅")
+    st.info("⚠️ **Resetting collections is permanent.** Choose the data to wipe.")
+
+    # --- QDRANT CLIENT CONNECTION ---
+    try:
+        client_reset = make_qdrant_client()
+    except Exception as e:
+        st.error(f"Failed to connect to Qdrant: {e}")
+        # st.stop()
+
+    # ----------------------------------------------------
+    # 1. Reset PG Logs Collection (Full App State Reset)
+    # ----------------------------------------------------
+    st.subheader("Reset Qdrant Collection")
+    st.warning(f"This clears all embedded log datas stored in the collection")
+    
+    confirm_logs = st.checkbox(
+        f"I understand — reset the Qdrant collection",
+        key="pg_logs_reset_confirmed",
+        value=True  # Default state is ticked
+    )
+
+    if st.button("🔴 Reset Qdrant logs Collection", key="reset_logs_button") and confirm_logs:
+        
+        # --- CRITICAL: Clear Streamlit State & File Uploader ---
+        st.session_state.uploaded_data = {} 
+        st.session_state.upload_sig = None
+        st.session_state.index_ready = False
+        
+        # Increment the key to force the st.file_uploader widget to reset
+        if 'file_uploader_key' in st.session_state:
+            st.session_state.file_uploader_key += 1
+        else:
+            st.session_state.file_uploader_key = 1 
+        # --- END CLEAR STATE ---
+
+        with st.spinner(f"Recreating '{LOG_COLLECTION}' to wipe data..."):
+            try:
+                # Recreate to ensure the collection exists but is empty
+                client_reset.recreate_collection(
+                    collection_name=LOG_COLLECTION,
+                    vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE)
+                )
+                st.success(f"✅ Successfully wiped all the datas in Qdrant collection")
+                
+            except Exception as e:
+                st.error(f"Failed to wipe collection: {e}")
+
+        st.rerun()
+
+    st.markdown("---")
+    
+    # ----------------------------------------------------
+    # 2. Reset Query Cache Collection (Minimal State Reset)
+    # ----------------------------------------------------
+    st.subheader("Reset Query Cache Collection")
+    st.info(f"This clears all cached summaries and root-cause analyses stored")
+    
+    confirm_cache = st.checkbox(
+        f"I understand — reset the Cache collection",
+        key="cache_reset_confirmed",
+        value=True  # Default state is ticked
+    )
+
+    if st.button("🟡 Reset Query Cache Collection Only", key="reset_cache_button") and confirm_cache:
+        
+        with st.spinner(f"Recreating collection to wipe cache..."):
+            try:
+                # Recreate to ensure the collection exists but is empty
+                client_reset.recreate_collection(
+                    collection_name=CACHE_COLLECTION,
+                    vectors_config={
+                         "query_vec": VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE)
+                    }
+                )
+                st.success(f"✅ Successfully wiped data in query cache collection")
+                
+            except Exception as e:
+                st.error(f"Failed to wipe collection : {e}")
 
 with tab3:
     st.markdown('<div style="padding-top:3rem;"></div>', unsafe_allow_html=True)
@@ -741,6 +866,7 @@ with tab3:
         styled_logs_df = logs_df_total.style  # empty styled DF
 
         st.success("All log records removed. PostgreSQL logs table is now empty ✅")
+        st.rerun()
 
 with tab4:
     st.markdown('<div style="padding-top:3rem;"></div>', unsafe_allow_html=True)
@@ -803,15 +929,17 @@ st.sidebar.markdown("""
 st.sidebar.markdown("<div style='height:20px;'></div>", unsafe_allow_html=True)
 
 # ------------------- File uploader -------------------
+# ------------------- File uploader -------------------
 if "uploaded_data" not in st.session_state:
     st.session_state.uploaded_data = {}
 
 uploaded_files = st.sidebar.file_uploader(
     "📁 Upload log files",
     type=["txt", "log"],
-    accept_multiple_files=True
+    accept_multiple_files=True,
+    # CRITICAL: Use the dynamic key here
+    key=st.session_state.file_uploader_key 
 )
-
 # -------------------------
 # Qdrant upsert with retries/backoff
 # -------------------------
@@ -1047,8 +1175,6 @@ def expand_context_around_hit(hit, window_seconds=3600):
     out = sorted(out, key=lambda p: (p.payload.get("ts", 0), p.payload.get("pid") or 0))
     return out
 
-import re
-
 # Regex to find PIDs in DETAIL lines, e.g., "Process 25002 waits for ShareLock ... blocked by process 24891"
 DETAIL_PID_RE = re.compile(r'Process (\d+) waits .*?blocked by process (\d+)', re.IGNORECASE)
 
@@ -1078,7 +1204,6 @@ def get_deadlock_hit_for_pid(hits, pid):
 
     return None
 
-# -------------------------
 ## -------------------------
 # Deadlock helpers (REPLACEMENT)
 # -------------------------
@@ -1282,6 +1407,53 @@ with app_tab:
         ingest_click = st.button("Ingest & Index")
     with col_btn2:
         auto_index_new = st.checkbox("Auto-index on change", value=True)
+    
+
+    import streamlit as st
+
+    # ------------------- LLM Backends -------------------
+    LLM_BACKENDS = [
+        "OpenAI",
+        "Google Gemini",
+        "Claude",
+        "Perplexity",
+        "Deep Seek",
+        "Grok",
+        "Meta"
+    ]
+
+    # ------------------- Sidebar: Backend selection -------------------
+    selected_backend = st.sidebar.selectbox("Select LLM backend", LLM_BACKENDS)
+
+    # ------------------- Sidebar: User types model name -------------------
+    typed_model = st.sidebar.text_input(f"Enter {selected_backend} model name")
+
+    # ------------------- Sidebar: API Key / Password -------------------
+    typed_password = st.sidebar.text_input(f"Enter {selected_backend} API key / password", type="password")
+
+    # ------------------- Validation -------------------
+    model_ready = typed_model.strip() != ""
+    password_ready = typed_password.strip() != ""
+
+    if not model_ready:
+        st.sidebar.warning("Please enter a model name to proceed.")
+    if not password_ready:
+        st.sidebar.warning("Please enter the API key / password to proceed.")
+
+    # ------------------- Example: Using selection in main app -------------------
+    if st.button("Show LLM choice"):
+        if model_ready and password_ready:
+            st.write(f"Backend: {selected_backend}")
+            st.write(f"Model: {typed_model}")
+            st.write(f"API key provided ✅")
+        else:
+            st.warning("Enter both model name and API key first.")
+
+    # ------------------- Integration hint for summary section -------------------
+    # Later, in your Generate Summary logic:
+    # llm_response = call_llm(selected_backend, typed_model, typed_password, prompts)
+
+
 
     # ------------------- Determine whether to index -------------------
     should_index_now = False
@@ -1426,9 +1598,126 @@ with app_tab:
         st.session_state.expander_open = True
 
     # -------------------------
-    # Search Button
+    # Configuration
     # -------------------------
-    # Search Button
+    QUERY_CACHE_COLLECTION = "query_cache"
+    VECTOR_NAME = "query_vec"
+    EMBEDDING_DIM = 1536 # your LLM embedding size
+
+    # -------------------------
+    # Connect to Qdrant (using Streamlit Caching)
+    # -------------------------
+    
+    # ⚠️ Use @st.cache_resource to ensure this initialization runs only ONCE.
+    @st.cache_resource
+    def init_qdrant_cache_client():
+        """Initializes the Qdrant client and ensures the query_cache collection exists with correct config."""
+        
+        client = QdrantClient(url="http://localhost:6333")
+        
+        REQUIRED_VECTORS_CONFIG = {
+            VECTOR_NAME: VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE)
+        }
+
+        try:
+            if client.collection_exists(QUERY_CACHE_COLLECTION):
+                # Collection exists: Check configuration to only delete if necessary
+                collection_info = client.get_collection(collection_name=QUERY_CACHE_COLLECTION)
+                current_vectors = collection_info.config.params.vectors
+
+                # Check if the expected vector name is present and matches the size
+                is_correctly_configured = (
+                    VECTOR_NAME in current_vectors and 
+                    current_vectors[VECTOR_NAME].size == EMBEDDING_DIM
+                )
+                
+                if not is_correctly_configured:
+                    # Mismatch found (old 'default' config, wrong size, etc.). Force recreate.
+                    print(f"⚠️ Vector config mismatch for '{QUERY_CACHE_COLLECTION}'. Deleting and recreating.")
+                    client.delete_collection(collection_name=QUERY_CACHE_COLLECTION)
+                    client.create_collection(
+                        collection_name=QUERY_CACHE_COLLECTION,
+                        vectors_config=REQUIRED_VECTORS_CONFIG
+                    )
+                    print(f"✅ Recreated collection '{QUERY_CACHE_COLLECTION}' with vector name '{VECTOR_NAME}'.")
+                else:
+                    # Configuration is correct. Do nothing.
+                    print(f"✅ Collection '{QUERY_CACHE_COLLECTION}' is correctly configured.")
+            else:
+                # Collection does not exist. Create it for the first time.
+                client.create_collection(
+                    collection_name=QUERY_CACHE_COLLECTION,
+                    vectors_config=REQUIRED_VECTORS_CONFIG
+                )
+                print(f"✅ Created collection '{QUERY_CACHE_COLLECTION}' with vector name '{VECTOR_NAME}'")
+
+            return client
+
+        except Exception as e:
+            # Handle failure to connect/initialize
+            st.error(f"Failed to initialize Qdrant query cache: {e}")
+            # Raising the exception will stop the app from proceeding with a broken client
+            raise 
+
+    # -------------------------
+    # Actual Qdrant Client Variable
+    # This line runs once on startup and retrieves the cached client on subsequent runs.
+    # -------------------------
+    client = init_qdrant_cache_client()
+  
+    # -------------------------
+    # Helpers
+    # -------------------------
+    def ensure_float_vector(vec):
+        try:
+            vec = np.asarray(vec, dtype=float).flatten()
+            return vec.tolist()
+        except Exception as e:
+            print("❌ ensure_float_vector failed:", e, "input vec:", vec)
+            raise ValueError(f"Embedding vector contains non-numeric values: {e}")
+
+    def cache_query_answer(query: str, query_vec, answer: str):
+        pid = str(uuid.uuid4())
+        vec = ensure_float_vector(query_vec)
+        payload = {
+            "query": query,
+            "answer": answer,
+            "timestamp": int(time.time()),
+            "usage_count": 1
+        }
+        client.upsert(
+            collection_name=QUERY_CACHE_COLLECTION,
+            points=[PointStruct(id=pid, vector={VECTOR_NAME: vec}, payload=payload)],
+            wait=True
+        )
+        print(f"✅ Cached query '{query}' in Qdrant")
+
+    def lookup_cached_answer(query_vec, threshold: float = 0.9):
+        vec = ensure_float_vector(query_vec)
+        results = client.search(
+            collection_name=QUERY_CACHE_COLLECTION,
+            query_vector=(VECTOR_NAME, vec),
+            with_payload=True,
+            limit=1
+        )
+        if results:
+            hit = results[0]
+            if hit.score >= threshold:
+                return hit.payload.get("answer")
+        return None
+
+    def smart_cache_lookup(query_vec):
+        cached = lookup_cached_answer(query_vec, threshold=0.95)
+        if cached:
+            return cached, "exact_semantic"
+        cached = lookup_cached_answer(query_vec, threshold=0.85)
+        if cached:
+            return cached, "broad_semantic"
+        return None, None
+
+    # -------------------------
+    # Main Search + Summary
+    # -------------------------
     if st.button("Search"):
         if not q:
             st.warning("Enter a query.")
@@ -1453,14 +1742,13 @@ with app_tab:
             else:
                 st.session_state.last_hits = hits
 
-                # -------------------------
-                # Search Results in Expander
-                # -------------------------
-                # -------------------------
                 with st.expander("📑 Top Matches and Context", expanded=True):
                     all_logs_for_rerank = []
                     hits_to_process = []
-                    # Check if the query mentions deadlock
+
+                    # -------------------------
+                    # Deadlock detection
+                    # -------------------------
                     if "deadlock detected" in q.lower():
                         query_pid = extract_pid_from_query(q)
                         deadlock_hit = get_deadlock_hit_for_pid(hits, query_pid)
@@ -1474,11 +1762,9 @@ with app_tab:
                             pids = parts["pids"]
                             pairs = parts["pairs"]
 
-                            # Fetch ±120s context for display
                             ctx = fetch_pid_window(dl_ts, pids, window_seconds=120)
                             render_deadlock_report(deadlock_hit, ctx)
 
-                            # Prepare info for LLM
                             last_statements = []
                             for pid in sorted(pids):
                                 ts_stmt, stmt = find_last_statement_before(dl_ts, [p for p in ctx if p.payload.get("pid") == pid])
@@ -1505,35 +1791,30 @@ with app_tab:
                                 ])
                             ]
                         else:
-                            # Fallback to non-deadlock processing
                             hits_to_process = hits[:5]
                     else:
-                        # Non-deadlock query
                         hits_to_process = hits[:5]
 
                     # -------------------------
-                    # Non-deadlock: show top hits & context, prepare for rerank
+                    # Non-deadlock: display top hits & context
                     # -------------------------
                     if hits_to_process:
                         st.markdown("### 🎯 Top Matches")
                         window_sec = 1800
                         window_str = "±30 minutes"
                         all_context_logs = []
-                        all_logs_for_rerank = []  # reset
+                        all_logs_for_rerank = []
 
                         for i, hit in enumerate(hits_to_process, start=1):
                             st.markdown(f"#### #{i}")
                             hit_text = hit.payload.get("full_text", "")
                             st.code(hit_text, language="text")
-
-                            # ✅ Always include the original semantic hit itself
                             all_context_logs.append({
                                 "ts": hit.payload.get("ts"),
                                 "message": hit.payload.get("message"),
                                 "full_text": hit_text
                             })
 
-                            # Expand context around hit
                             ctx = expand_context_around_hit(hit, window_seconds=window_sec)
                             for p in ctx:
                                 ts = p.payload.get("ts")
@@ -1541,7 +1822,7 @@ with app_tab:
                                 log_text = p.payload.get("full_text", "")
                                 all_context_logs.append({"ts": ts, "message": msg, "full_text": log_text})
 
-                        # Deduplicate (by timestamp + message)
+                        # Deduplicate logs
                         unique_context = []
                         seen_keys = set()
                         for log in all_context_logs:
@@ -1550,19 +1831,15 @@ with app_tab:
                                 unique_context.append(log)
                                 seen_keys.add(key)
 
-                        # Display logs & prepare rerank set
                         st.markdown(f"**Context ({window_str} + top hits)**")
                         for log in unique_context:
                             st.text(log["full_text"][:2000])
                             all_logs_for_rerank.append(log["full_text"])
 
                         # -------------------------
-                        # Rerank logs for summarization
+                        # Rerank logs for LLM
                         # -------------------------
                         if all_logs_for_rerank:
-                            from sklearn.metrics.pairwise import cosine_similarity
-                            import numpy as np
-
                             seen = set()
                             unique_logs = []
                             for log_text in all_logs_for_rerank:
@@ -1573,11 +1850,10 @@ with app_tab:
                             log_vecs = embed_texts(unique_logs)
                             q_vec = embed_texts([q])[0].reshape(1, -1)
                             sims = cosine_similarity(q_vec, log_vecs)[0]
-                            top_idx = np.argsort(sims)[::-1][:20]
+                            top_idx = np.argsort(sims)[::-1][:1]
                             st.session_state.reranked_logs = [unique_logs[i] for i in top_idx]
 
                     st.session_state.expander_open = False
-
     # -------------------------
     # Placeholder for Summary Section
     # -------------------------
@@ -1613,72 +1889,209 @@ with app_tab:
     st.markdown('<div id="top"></div>', unsafe_allow_html=True)
 
     # -------------------------
-    # Summary Button
-    # -------------------------
-    # Summary Button
-    # -------------------------
-    if st.session_state.last_hits and (not st.session_state.expander_open or st.session_state.show_summary_button):
+    # Summary Section & Button
+
+    def call_llm(backend, model_name, api_key, messages, max_tokens_per_request=2000):
+        """
+        Calls the selected LLM backend with validation and input truncation.
+
+        Args:
+            backend (str): LLM backend name (OpenAI, Gemini, Claude, etc.).
+            model_name (str): Model name provided by the user.
+            api_key (str): API key / password for authentication.
+            messages (list): List of dicts {"role": ..., "content": ...}.
+            max_tokens_per_request (int): Max tokens per single request to avoid large payloads.
+
+        Returns:
+            str: LLM-generated response text.
+        """
+        if not model_name.strip():
+            raise ValueError("Model name cannot be empty.")
+        if not api_key.strip():
+            raise ValueError("API key / password cannot be empty.")
+        if not messages or not all("role" in m and "content" in m for m in messages):
+            raise ValueError("Messages must be a list of dicts with 'role' and 'content'.")
+
+        # Truncate content
+        truncated_messages = []
+        for m in messages:
+            content = m["content"]
+            if len(content) > max_tokens_per_request:
+                content = content[:max_tokens_per_request] + "\n\n[TRUNCATED]"
+            truncated_messages.append({"role": m["role"], "content": content})
+
+        backend_lower = backend.lower()
+
+        # OpenAI / Gemini (OpenAI-compatible API)
+        if backend_lower in ["openai", "google gemini"]:
+            from openai import OpenAI
+            client = OpenAI(api_key=api_key)
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=truncated_messages,
+                temperature=0.2,
+                max_tokens=2000
+            )
+            return response.choices[0].message.content
+
+        # Claude
+        elif backend_lower == "claude":
+            url = "https://api.anthropic.com/v1/claude-3/messages"
+            headers = {"Authorization": f"Bearer {api_key}"}
+            data = {
+                "model": model_name,
+                "messages": truncated_messages,  # proper list
+                "temperature": 0.2,
+                "max_tokens_to_sample": 2000
+            }
+            resp = requests.post(url, headers=headers, json=data)
+            resp.raise_for_status()
+            return resp.json()["completion"]
+
+        # Perplexity
+        elif backend_lower == "perplexity":
+            url = "https://api.perplexity.ai/chat/completions"
+            headers = {"Authorization": f"Bearer {api_key}"}
+            data = {
+                "model": model_name,
+                "messages": truncated_messages,
+                "temperature": 0.2,
+                "max_tokens": 2000
+            }
+            resp = requests.post(url, headers=headers, json=data)
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"]
+
+        # Deep Seek
+        elif backend_lower == "deep seek":
+            url = "https://api.deepseek.com/v1/chat/completions"
+            headers = {"Authorization": f"Bearer {api_key}"}
+            data = {
+                "model": model_name,
+                "messages": truncated_messages,
+                "temperature": 0.2,
+                "max_tokens": 2000
+            }
+            resp = requests.post(url, headers=headers, json=data)
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"]
+
+        # Grok (xAI)
+        elif backend_lower == "grok":
+            url = "https://api.x.ai/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
+            data = {
+                "model": model_name,
+                "messages": truncated_messages,
+                "temperature": 0.2,
+                "max_tokens": 2000
+            }
+            resp = requests.post(url, headers=headers, json=data)
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"]
+
+        # Meta
+        elif backend_lower == "meta":
+            url = "https://api.meta.com/v1/chat/completions"
+            headers = {"Authorization": f"Bearer {api_key}"}
+            data = {
+                "model": model_name,
+                "messages": truncated_messages,
+                "temperature": 0.2,
+                "max_tokens": 2000
+            }
+            resp = requests.post(url, headers=headers, json=data)
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"]
+
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+    # ------------------------- Generate Summary Section -------------------------
+    st.markdown('<div id="summary_section"></div>', unsafe_allow_html=True)
+
+    if st.session_state.get("last_hits") and (not st.session_state.get("expander_open", False) or st.session_state.get("show_summary_button", False)):
         if st.button("✨ Generate Summary", key="summary_button"):
-            if not OPENAI_API_KEY:
-                st.error("OPENAI_API_KEY not set.")
-            else:
-                with st.spinner("Summarizing with OpenAI..."):
-                    try:
-                        if "reranked_logs" not in st.session_state or not st.session_state.reranked_logs:
+
+            # ------------------------- Validate model & password -------------------------
+            if not model_ready:
+                st.warning("Enter a valid LLM model name before generating summary.")
+                st.stop()
+            if not password_ready:
+                st.warning("Enter the API key / password before generating summary.")
+                st.stop()
+
+            with st.spinner("Checking cache..."):
+                try:
+                    # ------------------------- Embed the query -------------------------
+                    q_vec = embed_texts([q])[0]
+                    q_vec_list = np.asarray(q_vec, dtype=float).flatten().tolist()
+                    print("🔹 Query embedding sample:", q_vec_list[:5])
+
+                    # ------------------------- Lookup in Qdrant cache -------------------------
+                    cached_answer, cache_type = smart_cache_lookup(q_vec_list)
+                    print("✅ Cache lookup result:", cached_answer, cache_type)
+
+                    if cached_answer:
+                        st.success(f"⚡ Served from cache ({cache_type})")
+                        st.subheader("✅ Root Cause Summary")
+                        st.markdown(cached_answer)
+                    else:
+                        # ------------------------- Check reranked logs -------------------------
+                        logs_to_summarize = st.session_state.get("reranked_logs", [])
+                        if not logs_to_summarize:
                             st.warning("No logs available for summarization. Perform a search first.")
-                        else:
-                            # Deduplicate logs (keep first occurrence)
-                            seen = set()
-                            unique_logs = []
-                            for log in st.session_state.reranked_logs:
-                                if log not in seen:
-                                    unique_logs.append(log)
-                                    seen.add(log)
+                            st.stop()
 
-                            # Truncate logs to 1500 chars for summarization
-                            summary_logs = [log[:2000] for log in unique_logs]
+                        # Deduplicate logs
+                        seen = set()
+                        unique_logs = []
+                        for log in logs_to_summarize:
+                            if log not in seen:
+                                seen.add(log)
+                                unique_logs.append(log)
 
-                            # Concatenate for LLM
-                            corpus = "\n\n---\n\n".join(summary_logs[:20])  # only top 20 unique logs
+                        summary_logs = [log[:2000] for log in unique_logs]
+                        corpus = "\n\n---\n\n".join(summary_logs[:1])
 
-                            # Show what is being sent (view-only)
-                            st.markdown(
-                                f"""
-                                <textarea readonly style="
-                                    width: 100%;
-                                    height: 300px;
-                                    background-color: white;
-                                    color: black;
-                                    border: 1px solid #ddd;
-                                    padding: 10px;
-                                    font-family: monospace;
-                                    font-size: 14px;
-                                    overflow:auto;
-                                    resize: none;
-                                ">{corpus}</textarea>
-                                """,
-                                unsafe_allow_html=True
-                            )
+                        # Display logs being sent
+                        st.markdown(f"""
+                        <textarea readonly style="width:100%; height:300px; background-color:white; color:black; border:1px solid #ddd; padding:10px; font-family:monospace; font-size:14px; overflow:auto; resize:none;">{corpus}</textarea>
+                        """, unsafe_allow_html=True)
 
-                            system_prompt = (
-                                "You are a PostgreSQL SRE. "
-                                "Given PostgreSQL logs, produce a concise root-cause explanation and actionable steps."
-                            )
-                            user_prompt = (
-                                f"User Query:\n{q}\n\n"
-                                f"Relevant logs (or deadlock info):\n{corpus}\n\n"
-                                "Instructions: Analyze the logs strictly in the context of the user's query above. "
-                                "Provide a concise root-cause explanation, evidence with timestamps, and 3 actionable fixes "
-                                "that directly address the query. Do not include irrelevant information."
-                            )
+                        # ------------------------- Prepare prompts -------------------------
+                        system_prompt = (
+                            "You are a PostgreSQL SRE. "
+                            "Given PostgreSQL logs, produce a concise root-cause explanation and actionable steps."
+                        )
+                        user_prompt = (
+                            f"User Query:\n{q}\n\n"
+                            f"Relevant logs:\n{corpus}\n\n"
+                            "Instructions: Analyze the logs strictly in the context of the user's query. "
+                            "Provide a concise root-cause explanation, evidence with timestamps, "
+                            "and 3 actionable fixes directly addressing the query."
+                        )
 
-                            content = call_openai_chat([
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": user_prompt}
-                            ])
+                        # ------------------------- Call LLM dynamically -------------------------
+                        print(f"📝 Sending prompts to {selected_backend} (model: {typed_model})...")
+                        llm_response = call_llm(selected_backend, typed_model, typed_password, [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt}
+                        ])
+                        print("✅ LLM response received")
 
-                            st.subheader("✅ Root Cause Summary")
-                            st.markdown(content)
+                        # ------------------------- Display summary -------------------------
+                        st.subheader("✅ Root Cause Summary")
+                        st.markdown(llm_response)
 
-                    except Exception as e:
-                        st.error(f"LLM summarization failed: {e}")
+                        # ------------------------- Cache the answer -------------------------
+                        cache_query_answer(q, q_vec_list, llm_response)
+                        print("✅ Cached successfully")
+
+                except Exception as e:
+                    import traceback
+                    print("❌ Exception trace:", traceback.format_exc())
+                    st.error(f"LLM summarization failed: {e}")
